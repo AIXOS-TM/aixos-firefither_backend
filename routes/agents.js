@@ -54,8 +54,9 @@ router.post('/visits', upload.any(), async (req, res) => {
 
         if (!finalCustId) {
             // Create Lead Customer
-            const placeholderPass = '$2a$08$abcdefg...'; // Dummy hash
             const finalEmail = email || `lead-${Date.now()}@temp.com`;
+            // Placeholder hash — customer sets real password via email link
+            const placeholderPass = '$2a$08$unusable.placeholder.hash.xxxxxxxxxxxxxxxxxxxxxx';
 
             const { data: leadData, error: leadError } = await supabase
                 .from('customers')

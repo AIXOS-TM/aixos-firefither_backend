@@ -25,6 +25,7 @@ const chatRoutes = require('./routes/chat');
 const partnersRoutes = require('./routes/partners');
 const inquiryRoutes = require('./routes/inquiryRoutes');
 const maintenanceRoutes = require('./routes/maintenanceRoutes');
+const seniorAgentsRoutes = require('./routes/seniorAgents');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/agents', agentsRoutes);
@@ -36,6 +37,7 @@ app.use('/api/partner', partnersRoutes); // Added singular mount
 app.use('/api', maintenanceRoutes); // PATCH /inquiries/:id/accept, site-assessments, inspections
 app.use('/api', inquiryRoutes); // Mounts /api/inquiries, /api/inquiry-items, etc.
 app.use('/api', chatRoutes); // Mounts /api/queries and /api/customers/:id/header
+app.use('/api/senior-agents', seniorAgentsRoutes);
 
 
 app.listen(PORT, () => {
