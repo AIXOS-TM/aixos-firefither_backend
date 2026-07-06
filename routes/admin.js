@@ -1,6 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../supabase');
+const { verifyToken } = require('../middleware/auth');
+const { requireRole } = require('../middleware/requireRole');
+
+// Every route in this file is admin-only.
+router.use(verifyToken, requireRole('admin'));
 
 // GET /api/admin/agents?status=Pending
 router.get('/agents', async (req, res) => {

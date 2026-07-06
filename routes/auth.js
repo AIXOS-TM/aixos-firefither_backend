@@ -6,8 +6,11 @@ const supabase = require('../supabase');
 const multer = require('multer');
 const path = require('path');
 const nodemailer = require('nodemailer');
+const { verifyToken } = require('../middleware/auth');
+const { requireRole } = require('../middleware/requireRole');
 
 const SECRET_KEY = process.env.JWT_SECRET || 'super_secret_key_fire_marketplace';
+const IMPERSONATION_TTL_SECONDS = 45 * 60; // 45 minutes — short-lived by design
 
 // ── SMTP transporter (created once at startup) ──────────────────────────────
 
@@ -379,6 +382,109 @@ router.post('/login', async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════════════════════
+// ADMIN IMPERSONATION ("Login as Agent")
+// ══════════════════════════════════════════════════════════
+
+// POST /api/auth/impersonate/end
+// Closes out the audit session row. The actual session teardown (restoring
+// the admin's real token) happens client-side — this call is bookkeeping.
+//
+// Must be declared BEFORE '/impersonate/:agentId' — Express matches routes in
+// declaration order, and ':agentId' would otherwise greedily match the
+// literal path segment "end" too, routing this call through requireRole('admin')
+// and rejecting it (the caller is impersonating, so their role is 'agent').
+router.post('/impersonate/end', verifyToken, async (req, res) => {
+  if (!req.impersonation) {
+    return res.status(400).json({ error: 'Not currently impersonating.' });
+  }
+
+  try {
+    await supabase
+      .from('impersonation_sessions')
+      .update({ ended_at: new Date().toISOString(), end_reason: 'manual' })
+      .eq('id', req.impersonation.sessionId)
+      .is('ended_at', null);
+
+    res.json({ message: 'Impersonation session ended.' });
+  } catch (err) {
+    console.error('[impersonate/end] Error:', err);
+    res.status(500).json({ error: 'Failed to end impersonation session', details: err.message });
+  }
+});
+
+// POST /api/auth/impersonate/:agentId
+// Admin-only. Issues a short-lived JWT that carries the target agent's
+// identity plus an `imp` block identifying the real admin, so every
+// downstream request during the session is auditable and reversible.
+router.post('/impersonate/:agentId', verifyToken, requireRole('admin'), async (req, res) => {
+  const { agentId } = req.params;
+
+  // No chaining: an impersonation token can never be used to start another.
+  if (req.impersonation) {
+    return res.status(403).json({ error: 'Cannot start a new impersonation session while already impersonating.' });
+  }
+
+  try {
+    const { data: agent, error: agentErr } = await supabase
+      .from('agents')
+      .select('id, name, email, status')
+      .eq('id', agentId)
+      .maybeSingle();
+
+    if (agentErr) throw agentErr;
+    if (!agent) return res.status(404).json({ error: 'Agent not found.' });
+
+    const status = (agent.status || '').toLowerCase();
+    if (status !== 'accepted' && status !== 'active') {
+      return res.status(403).json({ error: 'Only active/accepted agents can be impersonated.' });
+    }
+
+    const { data: admin, error: adminErr } = await supabase
+      .from('admins')
+      .select('id, name, email')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (adminErr) throw adminErr;
+
+    const { data: session, error: sessionErr } = await supabase
+      .from('impersonation_sessions')
+      .insert({
+        admin_id: req.user.id,
+        agent_id: agent.id,
+        ip_address: req.ip,
+        user_agent: req.headers['user-agent'] || null,
+      })
+      .select()
+      .single();
+    if (sessionErr) throw sessionErr;
+
+    const impersonationToken = jwt.sign(
+      {
+        id: agent.id,
+        role: 'agent',
+        imp: {
+          adminId: req.user.id,
+          adminName: admin?.name || 'Admin',
+          sessionId: session.id,
+        },
+      },
+      SECRET_KEY,
+      { expiresIn: IMPERSONATION_TTL_SECONDS }
+    );
+
+    res.json({
+      impersonationToken,
+      agent: { id: agent.id, name: agent.name, email: agent.email, role: 'agent' },
+      adminName: admin?.name || 'Admin',
+      expiresAt: new Date(Date.now() + IMPERSONATION_TTL_SECONDS * 1000).toISOString(),
+    });
+  } catch (err) {
+    console.error('[impersonate] Error:', err);
+    res.status(500).json({ error: 'Failed to start impersonation session', details: err.message });
+  }
+});
 
 // FORGOT PASSWORD - SEND OTP
 router.post('/forgot-password', async (req, res) => {
