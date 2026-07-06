@@ -50,16 +50,35 @@ const transporter = nodemailer.createTransport({
   socketTimeout: 15000,
 });
 
+// Full SMTP error dump — Nodemailer/SMTPConnection errors carry most of the
+// useful diagnostic info on non-enumerable/plain properties that
+// console.error(err) or JSON.stringify(err) silently drop (errno, syscall,
+// address, port, command, stack). Log every field explicitly so production
+// logs actually show why a send failed instead of just "[FAILED]".
+function logSmtpError(label, err) {
+  console.error(`${label}`, {
+    message: err.message,
+    code: err.code,             // e.g. ETIMEDOUT, ECONNREFUSED, EAUTH, ESOCKET
+    errno: err.errno,
+    syscall: err.syscall,       // e.g. 'connect'
+    address: err.address,       // IP actually dialed (after DNS resolution)
+    port: err.port,
+    command: err.command,       // last SMTP command sent (e.g. 'CONN', 'AUTH LOGIN')
+    response: err.response,     // raw SMTP server response, if any was received
+    responseCode: err.responseCode,
+    stack: err.stack,
+  });
+}
+
+// Startup SMTP health check — runs once when this module loads (i.e. on
+// server boot), so a broken/blocked SMTP path shows up in the deploy logs
+// immediately instead of surfacing later as a user-facing "Failed to send" error.
+console.log('[SMTP] Running startup health check against', smtpHost + ':' + emailPort, '...');
 transporter.verify((err) => {
   if (err) {
-    console.error('[SMTP] Connection verify FAILED:', {
-      message: err.message,
-      code: err.code,
-      response: err.response,
-      responseCode: err.responseCode,
-    });
+    logSmtpError('[SMTP] Startup verify FAILED — outbound SMTP is not reachable/authenticating:', err);
   } else {
-    console.log('[SMTP] Ready — authenticated as', emailUser);
+    console.log('[SMTP] Startup verify OK — Ready and authenticated as', emailUser);
   }
 });
 // ────────────────────────────────────────────────────────────────────────────
@@ -447,14 +466,13 @@ router.post('/send-setup-email', async (req, res) => {
     console.log('[send-setup-email] SUCCESS — email accepted for:', info.accepted);
     res.status(200).json({ message: 'Setup email sent successfully', messageId: info.messageId, accepted: info.accepted });
   } catch (err) {
-    console.error('[send-setup-email] FAILED:', {
-      message: err.message,
+    logSmtpError('[send-setup-email] FAILED:', err);
+    res.status(500).json({
+      error: 'Failed to send setup email',
+      details: err.message,
       code: err.code,
-      response: err.response,
       responseCode: err.responseCode,
-      command: err.command,
     });
-    res.status(500).json({ error: 'Failed to send setup email', details: err.message });
   }
 });
 
@@ -607,10 +625,77 @@ router.get('/test-smtp', async (req, res) => {
 // POST /api/auth/promote-senior-agent
 // Admin promotes an agent, assigns a team, and sends activation email.
 router.post('/promote-senior-agent', async (req, res) => {
-  const { agentId, agentEmail, agentName, assignedAgentIds = [], adminName } = req.body;
+  const { agentId, agentEmail: bodyEmail, agentName: bodyName, assignedAgentIds = [], adminName, resendOnly } = req.body;
 
-  if (!agentId || !agentEmail) {
-    return res.status(400).json({ error: 'agentId and agentEmail are required' });
+  if (!agentId) {
+    return res.status(400).json({ error: 'agentId is required' });
+  }
+
+  // resendOnly: issue a fresh token and resend email without touching the team
+  if (resendOnly) {
+    try {
+      const { data: agentRow } = await supabase.from('agents').select('name, email').eq('id', agentId).maybeSingle();
+      if (!agentRow?.email) return res.status(404).json({ error: 'Agent not found or no email.' });
+
+      const activationToken = jwt.sign(
+        { sub: String(agentId), type: 'senior_agent_activation' },
+        SECRET_KEY,
+        { expiresIn: '48h' }
+      );
+      const tokenExpiresAt = new Date(Date.now() + 48 * 3_600_000).toISOString();
+
+      const { error: updErr } = await supabase.from('senior_agents').update({
+        activation_token: activationToken,
+        token_expires_at: tokenExpiresAt,
+        pin_hash: null,
+        is_activated: false,
+        updated_at: new Date().toISOString(),
+      }).eq('agent_id', agentId);
+      if (updErr) throw updErr;
+
+      const frontendUrl    = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+      const activationLink = `${frontendUrl}/senior-agent/activate?token=${activationToken}`;
+
+      await transporter.sendMail({
+        from: `"AIXOS Firefighter" <${emailUser}>`,
+        to: agentRow.email,
+        subject: 'Senior Agent Activation — New Link',
+        html: `
+          <div style="font-family:sans-serif;max-width:520px;margin:auto;padding:24px">
+            <h2 style="color:#0f172a">Hi ${agentRow.name || 'Agent'},</h2>
+            <p style="color:#475569;line-height:1.6">
+              A new activation link has been generated for your Senior Agent account.
+              Click the button below to set your 6-digit PIN. This link is valid for <strong>48 hours</strong>.
+            </p>
+            <div style="text-align:center;margin:32px 0">
+              <a href="${activationLink}"
+                 style="background:#ef4444;color:#fff;padding:14px 36px;border-radius:12px;
+                        text-decoration:none;display:inline-block;font-weight:900;font-size:16px">
+                Activate Senior Agent Access
+              </a>
+            </div>
+            <p style="color:#94a3b8;font-size:12px;text-align:center">This link expires in 48 hours.</p>
+          </div>
+        `,
+      });
+
+      return res.json({ message: 'Activation email resent successfully.' });
+    } catch (err) {
+      logSmtpError('[promote-senior-agent/resend] Error:', err);
+      return res.status(500).json({
+        error: 'Failed to resend activation email',
+        details: err.message,
+        code: err.code,
+        responseCode: err.responseCode,
+      });
+    }
+  }
+
+  const agentEmail = bodyEmail;
+  const agentName  = bodyName;
+
+  if (!agentEmail) {
+    return res.status(400).json({ error: 'agentEmail is required' });
   }
   if (assignedAgentIds.length > 10) {
     return res.status(400).json({ error: 'Maximum 10 team members allowed' });
@@ -724,8 +809,13 @@ router.post('/promote-senior-agent', async (req, res) => {
     console.log('[promote-senior-agent] SUCCESS — email accepted for:', info.accepted);
     res.status(200).json({ message: 'Senior agent promoted and activation email sent', seniorAgentId: sa.id, emailAccepted: info.accepted });
   } catch (err) {
-    console.error('[promote-senior-agent] Error:', err);
-    res.status(500).json({ error: 'Failed to promote senior agent', details: err.message });
+    logSmtpError('[promote-senior-agent] Error:', err);
+    res.status(500).json({
+      error: 'Failed to promote senior agent',
+      details: err.message,
+      code: err.code,
+      responseCode: err.responseCode,
+    });
   }
 });
 
