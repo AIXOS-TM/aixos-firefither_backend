@@ -743,10 +743,10 @@ router.post('/promote-senior-agent', async (req, res) => {
       const { data: agentRow } = await supabase.from('agents').select('name, email').eq('id', agentId).maybeSingle();
       if (!agentRow?.email) return res.status(404).json({ error: 'Agent not found or no email.' });
 
-      const activationToken = jwt.sign(
+      const  activationToken = jwt.sign(
         { sub: String(agentId), type: 'senior_agent_activation' },
-        SECRET_KEY,
-        { expiresIn: '48h' }
+        SECRET_KEY, 
+        { expiresIn: '48h' } 
       );
       const tokenExpiresAt = new Date(Date.now() + 48 * 3_600_000).toISOString();
 
