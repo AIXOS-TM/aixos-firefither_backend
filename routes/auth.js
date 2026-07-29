@@ -2,12 +2,15 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const supabase = require('../supabase');
 const multer = require('multer');
 const path = require('path');
 const nodemailer = require('nodemailer');
 const { verifyToken } = require('../middleware/auth');
 const { requireRole } = require('../middleware/requireRole');
+
+const ROLE_TABLES = { agent: 'agents', customer: 'customers', admin: 'admins', partner: 'partners' };
 
 const SECRET_KEY = process.env.JWT_SECRET || 'super_secret_key_fire_marketplace';
 const IMPERSONATION_TTL_SECONDS = 45 * 60; // 45 minutes — short-lived by design
@@ -487,18 +490,56 @@ router.post('/impersonate/:agentId', verifyToken, requireRole('admin'), async (r
 });
 
 // FORGOT PASSWORD - SEND OTP
+// Accounts live in our own agents/customers/admins/partners tables (not Supabase
+// Auth), so the OTP is generated and emailed by us via the same SMTP transporter
+// used elsewhere in this file, and checked against the password_resets table.
 router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
+  const { email, role } = req.body;
+  const table = ROLE_TABLES[role];
+
+  if (!email || !table) {
+    return res.status(400).json({ error: 'A valid email and role are required' });
+  }
+
+  const emailLower = email.trim().toLowerCase();
 
   try {
-    // Use Supabase Auth to send the reset password email/OTP
-    const { error } = await supabase.auth.resetPasswordForEmail(email);
+    const { data: account } = await supabase.from(table).select('*').eq('email', emailLower).maybeSingle();
+    if (!account) return res.status(404).json({ error: 'No account found with that email.' });
 
-    if (error) throw error;
+    const otp = String(crypto.randomInt(100000, 1000000)); // always 6 digits
+    const otpHash = bcrypt.hashSync(otp, 8);
+    const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+
+    const { error: upsertErr } = await supabase
+      .from('password_resets')
+      .upsert({ email: emailLower, role, otp_hash: otpHash, expires_at: expiresAt }, { onConflict: 'email,role' });
+    if (upsertErr) throw upsertErr;
+
+    await transporter.sendMail({
+      from: `"AIXOS Firefighter" <${emailUser}>`,
+      to: emailLower,
+      subject: 'Your Password Reset Code',
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px">
+          <h2 style="color:#0f172a">Hi ${account.name || account.owner_name || 'there'},</h2>
+          <p style="color:#475569;line-height:1.6">
+            Use the code below to reset your password. It expires in <strong>10 minutes</strong>.
+          </p>
+          <div style="text-align:center;margin:32px 0">
+            <span style="display:inline-block;background:#f1f5f9;color:#0f172a;padding:16px 32px;
+                         border-radius:12px;font-size:32px;font-weight:900;letter-spacing:8px">${otp}</span>
+          </div>
+          <p style="color:#94a3b8;font-size:12px;text-align:center">
+            If you did not request this, you can safely ignore this email.
+          </p>
+        </div>
+      `,
+    });
 
     res.status(200).json({ message: 'OTP sent to your email.' });
   } catch (err) {
-    console.error('Supabase Forgot Password Error:', err);
+    logSmtpError('[forgot-password] Error:', err);
     res.status(500).json({ error: 'Error processing forgot password request', details: err.message });
   }
 });
@@ -626,34 +667,45 @@ router.post('/set-password', async (req, res) => {
 // VERIFY OTP & RESET PASSWORD
 router.post('/reset-password', async (req, res) => {
   const { email, otp, newPassword, role } = req.body;
+  const table = ROLE_TABLES[role];
 
-  let table = '';
-  if (role === 'agent') table = 'agents';
-  else if (role === 'customer') table = 'customers';
-  else if (role === 'admin') table = 'admins';
-  else return res.status(400).json({ error: 'Invalid role' });
+  if (!email || !otp || !newPassword || !table) {
+    return res.status(400).json({ error: 'Email, otp, newPassword and a valid role are required' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+
+  const emailLower = email.trim().toLowerCase();
 
   try {
-    // 1. Verify OTP with Supabase Auth
-    const { data, error: verifyError } = await supabase.auth.verifyOtp({
-      email,
-      token: otp,
-      type: 'recovery'
-    });
+    const { data: reset } = await supabase
+      .from('password_resets')
+      .select('otp_hash, expires_at')
+      .eq('email', emailLower)
+      .eq('role', role)
+      .maybeSingle();
 
-    if (verifyError) {
-      console.error('OTP Verification Error:', verifyError);
+    if (!reset) return res.status(400).json({ error: 'Invalid or expired OTP' });
+    if (new Date(reset.expires_at) < new Date()) {
+      await supabase.from('password_resets').delete().eq('email', emailLower).eq('role', role);
+      return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
+    }
+    if (!bcrypt.compareSync(String(otp), reset.otp_hash)) {
       return res.status(400).json({ error: 'Invalid or expired OTP' });
     }
 
-    // 2. Update Password in custom table
-    const hashedPassword = bcrypt.hashSync(newPassword, 8);
+    // Admins are still compared as plain text at login (see /login above) — match
+    // that existing behavior here rather than silently locking admins out.
+    const newStoredPassword = role === 'admin' ? newPassword : bcrypt.hashSync(newPassword, 8);
+
     const { error: updateError } = await supabase
       .from(table)
-      .update({ password: hashedPassword })
-      .eq('email', email);
-
+      .update({ password: newStoredPassword })
+      .eq('email', emailLower);
     if (updateError) throw updateError;
+
+    await supabase.from('password_resets').delete().eq('email', emailLower).eq('role', role);
 
     res.status(200).json({ message: 'Password reset successful.' });
   } catch (err) {
@@ -730,7 +782,7 @@ router.get('/test-smtp', async (req, res) => {
 
 // POST /api/auth/promote-senior-agent
 // Admin promotes an agent, assigns a team, and sends activation email.
-router.post('/promote-senior-agent', async (req, res) => {
+router.post('/promote-senior-agent', verifyToken, requireRole('admin'), async (req, res) => {
   const { agentId, agentEmail: bodyEmail, agentName: bodyName, assignedAgentIds = [], adminName, resendOnly } = req.body;
 
   if (!agentId) {
@@ -1015,9 +1067,12 @@ router.post('/set-senior-agent-pin', async (req, res) => {
 
 // POST /api/auth/verify-senior-agent-pin
 // Verifies the PIN entered on the Team Activity screen.
-router.post('/verify-senior-agent-pin', async (req, res) => {
-  const { agentId, pin } = req.body;
-  if (!agentId || !pin) return res.status(400).json({ error: 'agentId and pin are required' });
+// agentId is derived from the caller's own auth token, not client input, so one
+// agent can't probe another senior agent's PIN by guessing their agentId.
+router.post('/verify-senior-agent-pin', verifyToken, async (req, res) => {
+  const agentId = req.user.id;
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ error: 'pin is required' });
 
   try {
     const { data: sa } = await supabase
@@ -1041,6 +1096,77 @@ router.post('/verify-senior-agent-pin', async (req, res) => {
   } catch (err) {
     console.error('[verify-senior-agent-pin] Error:', err);
     res.status(500).json({ success: false, error: 'Verification failed', details: err.message });
+  }
+});
+
+// POST /api/auth/forgot-senior-agent-pin
+// Self-service PIN reset: the logged-in senior agent requests a fresh
+// activation link (same mechanism as admin "Resend Activation") without
+// needing an admin. agentId comes from the caller's own token.
+router.post('/forgot-senior-agent-pin', verifyToken, async (req, res) => {
+  const agentId = req.user.id;
+
+  try {
+    const { data: agentRow } = await supabase.from('agents').select('name, email').eq('id', agentId).maybeSingle();
+    if (!agentRow?.email) return res.status(404).json({ error: 'Agent not found or has no email on file.' });
+
+    const { data: sa } = await supabase.from('senior_agents').select('id').eq('agent_id', agentId).maybeSingle();
+    if (!sa) return res.status(404).json({ error: 'You are not registered as a Senior Agent.' });
+
+    const activationToken = jwt.sign(
+      { sub: String(agentId), type: 'senior_agent_activation' },
+      SECRET_KEY,
+      { expiresIn: '48h' }
+    );
+    const tokenExpiresAt = new Date(Date.now() + 48 * 3_600_000).toISOString();
+
+    const { error: updErr } = await supabase.from('senior_agents').update({
+      activation_token: activationToken,
+      token_expires_at: tokenExpiresAt,
+      pin_hash: null,
+      is_activated: false,
+      updated_at: new Date().toISOString(),
+    }).eq('agent_id', agentId);
+    if (updErr) throw updErr;
+
+    const frontendUrl    = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+    const activationLink = `${frontendUrl}/senior-agent/activate?token=${activationToken}`;
+
+    await transporter.sendMail({
+      from: `"AIXOS Firefighter" <${emailUser}>`,
+      to: agentRow.email,
+      subject: 'Reset Your Senior Agent PIN',
+      html: `
+        <div style="font-family:sans-serif;max-width:520px;margin:auto;padding:24px">
+          <h2 style="color:#0f172a">Hi ${agentRow.name || 'Agent'},</h2>
+          <p style="color:#475569;line-height:1.6">
+            We received a request to reset the PIN on your Senior Agent account.
+            Click the button below to create a new 6-digit PIN. This link is valid for <strong>48 hours</strong>.
+          </p>
+          <div style="text-align:center;margin:32px 0">
+            <a href="${activationLink}"
+               style="background:#ef4444;color:#fff;padding:14px 36px;border-radius:12px;
+                      text-decoration:none;display:inline-block;font-weight:900;font-size:16px">
+              Reset My PIN
+            </a>
+          </div>
+          <p style="color:#94a3b8;font-size:12px;text-align:center">
+            If you did not request this, you can safely ignore this email — your current PIN stays active until you set a new one.<br/>
+            This link expires in 48 hours.
+          </p>
+        </div>
+      `,
+    });
+
+    res.json({ message: 'PIN reset link sent to your email.' });
+  } catch (err) {
+    logSmtpError('[forgot-senior-agent-pin] Error:', err);
+    res.status(500).json({
+      error: 'Failed to send PIN reset email',
+      details: err.message,
+      code: err.code,
+      responseCode: err.responseCode,
+    });
   }
 });
 

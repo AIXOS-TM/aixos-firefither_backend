@@ -1,6 +1,8 @@
 const express = require('express');
 const router  = express.Router();
 const supabase = require('../supabase');
+const { verifyToken } = require('../middleware/auth');
+const { requireRole } = require('../middleware/requireRole');
 
 // GET /api/senior-agents
 // Admin: list all senior agents with their team member count.
@@ -61,7 +63,7 @@ router.get('/:id/team', async (req, res) => {
 // PUT /api/senior-agents/:id/team
 // Admin: replace the full team assignment for a senior agent.
 // Body: { assignedAgentIds: [number...] }  (max 10)
-router.put('/:id/team', async (req, res) => {
+router.put('/:id/team', verifyToken, requireRole('admin'), async (req, res) => {
   const { id } = req.params;
   const { assignedAgentIds = [] } = req.body;
 
@@ -90,7 +92,7 @@ router.put('/:id/team', async (req, res) => {
 
 // DELETE /api/senior-agents/agent/:agentId
 // Admin: remove senior agent status for an agent.
-router.delete('/agent/:agentId', async (req, res) => {
+router.delete('/agent/:agentId', verifyToken, requireRole('admin'), async (req, res) => {
   const { agentId } = req.params;
   try {
     const { error } = await supabase
