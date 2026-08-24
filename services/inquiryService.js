@@ -1,6 +1,20 @@
 const supabase = require('../supabase');
 
 /**
+ * Allowed status transitions for Validation inquiries. Other inquiry types
+ * (Maintenance/Refill/New Unit) keep their own status handling untouched —
+ * this only gates the generic PATCH /inquiries/:id path when the target
+ * row's type is 'validation'.
+ */
+const VALIDATION_STATUS_TRANSITIONS = {
+    pending: ['accepted', 'rejected'],
+    accepted: ['in_progress'],
+    in_progress: ['completed'],
+    completed: [],
+    rejected: [],
+};
+
+/**
  * Inquiry Service
  * Handles CRUD operations for inquiries, inquiry_items, and inquiry_item_services.
  */
@@ -69,6 +83,7 @@ class InquiryService {
                 .select(`
                     *,
                     customers (id, business_name, owner_name, email, phone, address),
+                    agents (id, name, email, phone),
                     inquiry_items (
                         *,
                         inquiry_item_services (*)
@@ -84,7 +99,20 @@ class InquiryService {
 
             const { data, error } = await query.maybeSingle();
             if (error) throw error;
-            return data || null;
+            if (!data) return null;
+
+            // Stickers consumed for this inquiry live in sticker_usage_history (one row
+            // per inquiry, written by consume_partner_sticker_for_inquiry when a partner
+            // accepts it) — inquiry_items.sticker_used is a legacy column that's never
+            // actually set by anything running today, so it can't be used as the source.
+            const { data: stickerUsage, error: stickerError } = await supabase
+                .from('sticker_usage_history')
+                .select('quantity, used_for, used_at')
+                .eq('inquiry_id', inquiryId)
+                .maybeSingle();
+            if (stickerError) console.error('[InquiryService] sticker_usage_history lookup error:', stickerError);
+
+            return { ...data, sticker_usage: stickerUsage || null };
         } catch (error) {
             console.error('[InquiryService] getInquiryById error:', error);
             throw new Error(`Unable to fetch inquiry details: ${error.message}`);
@@ -95,6 +123,33 @@ class InquiryService {
      * Update an inquiry record.
      */
     async updateInquiry(inquiryId, updates, partnerId = null) {
+        if (updates && typeof updates.status === 'string') {
+            let current;
+            try {
+                const { data, error } = await supabase
+                    .from('inquiries')
+                    .select('status, type')
+                    .eq('id', inquiryId)
+                    .maybeSingle();
+                if (error) throw error;
+                current = data;
+            } catch (error) {
+                console.error('[InquiryService] updateInquiry transition lookup error:', error);
+                throw new Error(`Unable to update inquiry: ${error.message}`);
+            }
+
+            if (current && String(current.type || '').trim().toLowerCase() === 'validation') {
+                const from = String(current.status || 'pending').trim().toLowerCase();
+                const to = updates.status.trim().toLowerCase();
+                const allowed = VALIDATION_STATUS_TRANSITIONS[from] || [];
+                if (from !== to && !allowed.includes(to)) {
+                    const err = new Error(`Cannot move Validation inquiry from '${from}' to '${to}'.`);
+                    err.code = 'INVALID_STATUS_TRANSITION';
+                    throw err;
+                }
+            }
+        }
+
         try {
             let query = supabase
                 .from('inquiries')
@@ -110,6 +165,7 @@ class InquiryService {
             return data || null;
         } catch (error) {
             console.error('[InquiryService] updateInquiry error:', error);
+            if (error.code === 'INVALID_STATUS_TRANSITION') throw error;
             throw new Error(`Unable to update inquiry: ${error.message}`);
         }
     }
@@ -273,6 +329,7 @@ class InquiryService {
                     condition: item.condition || 'Good',
                     status: item.status || 'Active',
                     catalog_no: item.catalog_no || null,
+                    product_id: item.product_id || null,
                     maintenance_notes: item.maintenance_notes || null,
                     maintenance_voice_url: item.maintenance_voice_url || null,
                     maintenance_unit_photo_url: item.maintenance_unit_photo_url || null,

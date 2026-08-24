@@ -73,6 +73,39 @@ class PartnerController {
     }
 
     /**
+     * Get products assigned to the logged-in partner. Partner id is taken
+     * from the verified JWT, never a request param — a partner can never
+     * fetch another partner's assigned products through this endpoint.
+     */
+    async getMyProducts(req, res) {
+        const { id: partnerId, role } = req.user;
+
+        if (role !== 'partner') {
+            return res.status(403).json({
+                success: false,
+                data: null,
+                error: 'Access denied. Only partners can access this list.'
+            });
+        }
+
+        try {
+            const products = await partnerService.getAssignedProducts(partnerId);
+            return res.status(200).json({
+                success: true,
+                data: products,
+                error: null
+            });
+        } catch (error) {
+            console.error('[PartnerController] getMyProducts error:', error);
+            return res.status(500).json({
+                success: false,
+                data: null,
+                error: `Failed to fetch assigned products: ${error.message}`
+            });
+        }
+    }
+
+    /**
      * Get all partners. Accessible by agents/admins.
      */
     async getAllPartners(req, res) {

@@ -16,6 +16,12 @@ router.get('/dashboard', verifyToken, partnerController.getDashboard);
 router.get('/stats', verifyToken, partnerController.getStats);
 
 /**
+ * GET /api/partners/products
+ * Products assigned to the logged-in partner (own account only).
+ */
+router.get('/products', verifyToken, partnerController.getMyProducts);
+
+/**
  * GET /api/partners
  * Fetch all active partners.
  */

@@ -117,6 +117,13 @@ class InquiryController {
             });
         } catch (error) {
             console.error('[InquiryController] updateInquiry error:', error);
+            if (error.code === 'INVALID_STATUS_TRANSITION') {
+                return res.status(409).json({
+                    success: false,
+                    data: null,
+                    error: error.message
+                });
+            }
             return res.status(500).json({
                 success: false,
                 data: null,

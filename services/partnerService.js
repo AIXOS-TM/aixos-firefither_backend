@@ -77,6 +77,31 @@ class PartnerService {
     }
 
     /**
+     * Get products assigned to a specific partner (their own — never another
+     * partner's), joined to the product catalog. Deactivated products stay in
+     * the list (marked is_active:false) so assignment history/UI can still show
+     * them; only active ones should be offered for new work.
+     * @param {string} partnerId
+     */
+    async getAssignedProducts(partnerId) {
+        try {
+            const { data, error } = await supabase
+                .from('partner_products')
+                .select('id, assigned_at, products(id, name, description, category, image_url, is_active)')
+                .eq('partner_id', partnerId)
+                .order('assigned_at', { ascending: false });
+
+            if (error) throw error;
+            return (data || [])
+                .filter((row) => row.products)
+                .map((row) => ({ ...row.products, assigned_at: row.assigned_at }));
+        } catch (error) {
+            console.error('[PartnerService] getAssignedProducts error:', error);
+            throw new Error(`Unable to fetch assigned products: ${error.message}`);
+        }
+    }
+
+    /**
      * Get all active partners.
      */
     async getAllPartners() {
