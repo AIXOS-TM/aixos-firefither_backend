@@ -87,14 +87,19 @@ class PartnerService {
         try {
             const { data, error } = await supabase
                 .from('partner_products')
-                .select('id, assigned_at, products(id, name, description, category, image_url, is_active)')
+                .select('id, assigned_at, products(id, name, model_number, description, specifications, image_url, is_active, categories(id, name))')
                 .eq('partner_id', partnerId)
                 .order('assigned_at', { ascending: false });
 
             if (error) throw error;
             return (data || [])
                 .filter((row) => row.products)
-                .map((row) => ({ ...row.products, assigned_at: row.assigned_at }));
+                .map((row) => ({
+                    ...row.products,
+                    category: row.products.categories?.name || null,
+                    category_id: row.products.categories?.id || null,
+                    assigned_at: row.assigned_at,
+                }));
         } catch (error) {
             console.error('[PartnerService] getAssignedProducts error:', error);
             throw new Error(`Unable to fetch assigned products: ${error.message}`);
