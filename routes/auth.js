@@ -1176,3 +1176,8 @@ module.exports = router;
 // rayyan se puchna ha semarabia ka aur isko apne app ma intergrate krna hai 
 // partner flow ki testing krni hai 
 
+// isme ek issue ahraha hai mena isme renewal ki inquiry banai thi isne followup ki inquiry banai hai isko license renewal ki inquiry banani chahiya thi 
+
+// inquiry creeate hone ke bad partner ko notify krna chahiya that this customer required the renewal agr in case partner kehta hai i required some information and the so the partner to partner customer se mang sakta hai chat ma jis tarah se maintenance aur new unit ma chat thi aur phr inquiry ma partner ke bad button hoga accept aur reject ka renew krne se pehly ek aur cheez hai once it is accepted all documentation sath de ur phr partne ne quotation issue krni hai customer ko yeh flow is tarah se hoga jis tarah se mena maintenance ma quotation ka flow tha isme bhi isi tarah se hoga. 
+
+// partner dashboard pr new page create krna hai jisme inquiries ani chahiya Validation, refill, new unit, maintenance acha Validation ke tab ma New Validation, follow-up, license renewal ayega aur isme yeh hona cahiya k partner kaya offer kr raha hai for example agr partner ne Refill ke inquiry off krdi to phr inquiry create krne ke time jb partner select hoga to refill ki inquiry nahi ban sakti q k partner ne refill ki inquiry off krdi hai yeh ek tarah ka manage service ka page hoga 

@@ -1,4 +1,5 @@
 const supabase = require('../supabase');
+const { isRenewalOnlyInquiry } = require('./renewalHelpers');
 
 const INSPECTION_BUCKET = 'inspection-reports';
 const QUOTATION_BUCKET = 'quotations';
@@ -432,6 +433,16 @@ class MaintenanceService {
         if (!inquiry) return { ok: false, code: 404, message: 'Inquiry not found.' };
         if (!this.partnerOwnsInquiry(inquiry, partnerId)) return { ok: false, code: 403, message: 'Access denied.' };
 
+        // Renewal inquiries specifically require acceptance before a quotation can be
+        // created (unlike the rest of Maintenance, which has no such server-side gate
+        // today — this only applies when the inquiry is renewal-only).
+        if (await isRenewalOnlyInquiry(supabase, inquiryId)) {
+            const statusKey = String(inquiry.status || '').trim().toLowerCase();
+            if (statusKey !== 'accepted') {
+                return { ok: false, code: 409, message: 'Renewal must be accepted before a quotation can be created.' };
+            }
+        }
+
         // 1. Upload PDF
         const safeName = (file.originalname || 'quotation.pdf').replace(/[^\w.\-]+/g, '_');
         const path = `${inquiryId}/${Date.now()}_${safeName}`;
@@ -543,6 +554,27 @@ class MaintenanceService {
             type: 'quotation_update',
             title: `Quotation ${status}`
         });
+
+        // Renewal-specific: once the customer approves the quotation, the Renewal is
+        // done — auto-complete it (nothing else in the app auto-completes on quotation
+        // approval, so this is Renewal's own rule, not a change to Maintenance's).
+        if (status === 'approved' && await isRenewalOnlyInquiry(supabase, existing.inquiry_id)) {
+            await supabase
+                .from('inquiries')
+                .update({ status: 'completed', updated_at: new Date().toISOString() })
+                .eq('id', existing.inquiry_id);
+
+            await supabase.from('notifications').insert({
+                sender_id: String(user.id),
+                sender_role: user.role,
+                recipient_id: String(existing.customer_id),
+                recipient_role: 'customer',
+                message: `Your renewal request has been completed.`,
+                inquiry_id: existing.inquiry_id,
+                type: 'renewal_completed',
+                title: 'Renewal completed'
+            });
+        }
 
         return { ok: true, data };
     }

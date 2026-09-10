@@ -1,10 +1,15 @@
 const supabase = require('../supabase');
+const { isRenewalOnlyInquiry } = require('./renewalHelpers');
 
 /**
- * Allowed status transitions for Validation inquiries. Other inquiry types
- * (Maintenance/Refill/New Unit) keep their own status handling untouched —
- * this only gates the generic PATCH /inquiries/:id path when the target
- * row's type is 'validation'.
+ * Allowed status transitions for Validation inquiries (and, additionally,
+ * renewal-only Refill inquiries — see isGatedTransitionType below). Other
+ * inquiry types (Maintenance/Refill/New Unit) keep their own status handling
+ * untouched — this only gates the generic PATCH /inquiries/:id path when the
+ * target row's type is 'validation', or when it's a Refill inquiry made up
+ * entirely of License Renewal items (which has no delivery/pickup logistics
+ * and should behave like Validation's simple accept/reject lifecycle, not
+ * Refill's own).
  */
 const VALIDATION_STATUS_TRANSITIONS = {
     pending: ['accepted', 'rejected'],
@@ -138,12 +143,33 @@ class InquiryService {
                 throw new Error(`Unable to update inquiry: ${error.message}`);
             }
 
-            if (current && String(current.type || '').trim().toLowerCase() === 'validation') {
+            const typeKey = String(current?.type || '').trim().toLowerCase();
+            const isValidationType = typeKey === 'validation';
+            const isRefillType = typeKey === 'refill' || typeKey === 'refilled';
+            const renewalOnly = Boolean(current) && (isValidationType || isRefillType)
+                && await isRenewalOnlyInquiry(supabase, inquiryId);
+            const isGatedTransitionType = current && (isValidationType || (isRefillType && renewalOnly));
+
+            if (isGatedTransitionType) {
                 const from = String(current.status || 'pending').trim().toLowerCase();
                 const to = updates.status.trim().toLowerCase();
-                const allowed = VALIDATION_STATUS_TRANSITIONS[from] || [];
+                let allowed = VALIDATION_STATUS_TRANSITIONS[from] || [];
+
+                // A renewal-only inquiry that was auto-completed at creation (before
+                // that Validation shortcut was fixed) sits at 'completed' but was
+                // never really accepted and has no quotation — let the partner
+                // still Accept/Reject it.
+                if (renewalOnly && from === 'completed' && (to === 'accepted' || to === 'rejected')) {
+                    const { data: existingQuote } = await supabase
+                        .from('quotations')
+                        .select('id')
+                        .eq('inquiry_id', inquiryId)
+                        .maybeSingle();
+                    if (!existingQuote) allowed = [...allowed, 'accepted', 'rejected'];
+                }
+
                 if (from !== to && !allowed.includes(to)) {
-                    const err = new Error(`Cannot move Validation inquiry from '${from}' to '${to}'.`);
+                    const err = new Error(`Cannot move inquiry from '${from}' to '${to}'.`);
                     err.code = 'INVALID_STATUS_TRANSITION';
                     throw err;
                 }

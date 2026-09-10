@@ -123,6 +123,59 @@ class PartnerService {
             throw new Error(`Unable to fetch partners: ${error.message}`);
         }
     }
+
+    /**
+     * Get a partner's service availability rows. A missing row for a given
+     * (service_type, service_subtype) means "enabled" — see the migration
+     * comment on partner_service_availability — so this returns only the
+     * rows that have ever been explicitly set, not a full 6-row matrix.
+     */
+    async getServiceAvailability(partnerId) {
+        try {
+            const { data, error } = await supabase
+                .from('partner_service_availability')
+                .select('service_type, service_subtype, is_enabled')
+                .eq('partner_id', partnerId);
+
+            if (error) throw error;
+            return data || [];
+        } catch (error) {
+            console.error('[PartnerService] getServiceAvailability error:', error);
+            throw new Error(`Unable to fetch service availability: ${error.message}`);
+        }
+    }
+
+    /**
+     * Upsert one or more service-availability rows for a partner.
+     * @param {string} partnerId - UUID of the partner (from the verified JWT — never client-supplied).
+     * @param {{service_type: string, service_subtype?: string, is_enabled: boolean}[]} updates
+     */
+    async updateServiceAvailability(partnerId, updates) {
+        if (!Array.isArray(updates) || updates.length === 0) {
+            throw new Error('At least one service update is required.');
+        }
+
+        const rows = updates.map((u) => ({
+            partner_id: partnerId,
+            service_type: u.service_type,
+            service_subtype: u.service_subtype || 'default',
+            is_enabled: Boolean(u.is_enabled),
+            updated_at: new Date().toISOString(),
+        }));
+
+        try {
+            const { data, error } = await supabase
+                .from('partner_service_availability')
+                .upsert(rows, { onConflict: 'partner_id,service_type,service_subtype' })
+                .select('service_type, service_subtype, is_enabled');
+
+            if (error) throw error;
+            return data || [];
+        } catch (error) {
+            console.error('[PartnerService] updateServiceAvailability error:', error);
+            throw new Error(`Unable to update service availability: ${error.message}`);
+        }
+    }
 }
 
 module.exports = new PartnerService();

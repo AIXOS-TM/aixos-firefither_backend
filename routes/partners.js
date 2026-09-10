@@ -27,4 +27,16 @@ router.get('/products', verifyToken, partnerController.getMyProducts);
  */
 router.get('/', verifyToken, partnerController.getAllPartners);
 
+/**
+ * GET /api/partners/service-availability
+ * The logged-in partner's own service availability rows.
+ */
+router.get('/service-availability', verifyToken, partnerController.getMyServiceAvailability);
+
+/**
+ * PUT /api/partners/service-availability
+ * Update the logged-in partner's own service availability (body: { updates: [...] }).
+ */
+router.put('/service-availability', verifyToken, partnerController.updateMyServiceAvailability);
+
 module.exports = router;

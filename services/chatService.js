@@ -187,9 +187,12 @@ const chatService = {
      * Update message status
      */
     updateMessageStatus: async (messageId, status) => {
+        // NOTE: the `messages` table has no `updated_at` column — writing it here
+        // was failing every call with PGRST204 (harmless before, but the chat
+        // polling now retries it constantly).
         const { data, error } = await supabase
             .from('messages')
-            .update({ status, updated_at: new Date().toISOString() })
+            .update({ status })
             .eq('id', messageId)
             .select()
             .single();

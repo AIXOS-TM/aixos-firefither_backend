@@ -125,6 +125,93 @@ class PartnerController {
             });
         }
     }
+
+    /**
+     * Get the logged-in partner's own service availability. Partner id is
+     * taken from the verified JWT, never a request param.
+     */
+    async getMyServiceAvailability(req, res) {
+        const { id: partnerId, role } = req.user;
+
+        if (role !== 'partner') {
+            return res.status(403).json({
+                success: false,
+                data: null,
+                error: 'Access denied. Only partners can access this list.'
+            });
+        }
+
+        try {
+            const rows = await partnerService.getServiceAvailability(partnerId);
+            return res.status(200).json({
+                success: true,
+                data: rows,
+                error: null
+            });
+        } catch (error) {
+            console.error('[PartnerController] getMyServiceAvailability error:', error);
+            return res.status(500).json({
+                success: false,
+                data: null,
+                error: `Failed to fetch service availability: ${error.message}`
+            });
+        }
+    }
+
+    /**
+     * Update the logged-in partner's own service availability. Partner id is
+     * taken from the verified JWT — a partner can never modify another
+     * partner's settings through this endpoint, regardless of what the
+     * request body claims.
+     */
+    async updateMyServiceAvailability(req, res) {
+        const { id: partnerId, role } = req.user;
+
+        if (role !== 'partner') {
+            return res.status(403).json({
+                success: false,
+                data: null,
+                error: 'Access denied. Only partners can update this list.'
+            });
+        }
+
+        const updates = Array.isArray(req.body?.updates) ? req.body.updates : null;
+        if (!updates || updates.length === 0) {
+            return res.status(400).json({
+                success: false,
+                data: null,
+                error: 'updates array is required.'
+            });
+        }
+
+        const validTypes = new Set(['Validation', 'Refill', 'New Unit', 'Maintenance']);
+        const validSubtypes = new Set(['default', 'new', 'followup', 'license-renewal']);
+        for (const u of updates) {
+            if (!validTypes.has(u.service_type) || (u.service_subtype && !validSubtypes.has(u.service_subtype))) {
+                return res.status(400).json({
+                    success: false,
+                    data: null,
+                    error: `Invalid service_type/service_subtype: ${u.service_type}/${u.service_subtype}`
+                });
+            }
+        }
+
+        try {
+            const rows = await partnerService.updateServiceAvailability(partnerId, updates);
+            return res.status(200).json({
+                success: true,
+                data: rows,
+                error: null
+            });
+        } catch (error) {
+            console.error('[PartnerController] updateMyServiceAvailability error:', error);
+            return res.status(500).json({
+                success: false,
+                data: null,
+                error: `Failed to update service availability: ${error.message}`
+            });
+        }
+    }
 }
 
 module.exports = new PartnerController();
