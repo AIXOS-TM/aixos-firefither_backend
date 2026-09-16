@@ -1,6 +1,71 @@
 const supabase = require('../supabase');
+const { isRenewalOnlyInquiry } = require('./renewalHelpers');
 
 const chatService = {
+    /**
+     * Partner Chat Management — resolves whether a Partner is allowed to message
+     * (or read messages with) `otherPartyId` on a given inquiry, per the
+     * Admin-controlled partner_chat_settings table. Scoped to exactly three
+     * services (Maintenance, New Unit, License Renewal); every other inquiry type
+     * (Validation/Refill non-renewal, or an unrecognized inquiry) is untouched —
+     * `{ allowed: true }` with no lookup needed. `targetRole` is derived from the
+     * inquiry's own agent_id/customer_id, not from anything the client claims.
+     */
+    async resolvePartnerChatPermission(inquiryId, partnerId, otherPartyId) {
+        if (!inquiryId || !partnerId || !otherPartyId) return { allowed: true };
+
+        const { data: inquiry, error: inquiryErr } = await supabase
+            .from('inquiries')
+            .select('type, partner_id, agent_id, customer_id')
+            .eq('id', inquiryId)
+            .maybeSingle();
+
+        if (inquiryErr) {
+            console.error('[chatService] resolvePartnerChatPermission inquiry lookup error:', inquiryErr);
+            return { allowed: true }; // fail open — never block on an infra error
+        }
+        if (!inquiry) return { allowed: true };
+
+        if (String(inquiry.partner_id) !== String(partnerId)) {
+            return { allowed: false, reason: 'You are not the assigned partner for this inquiry.' };
+        }
+
+        let service = null;
+        if (inquiry.type === 'Maintenance') service = 'Maintenance';
+        else if (inquiry.type === 'New Unit') service = 'New Unit';
+        else if (['Validation', 'Refill'].includes(inquiry.type) && await isRenewalOnlyInquiry(supabase, inquiryId)) {
+            service = 'License Renewal';
+        }
+        if (!service) return { allowed: true }; // out of scope for this feature
+
+        const targetRole = String(otherPartyId) === String(inquiry.agent_id)
+            ? 'agent'
+            : String(otherPartyId) === String(inquiry.customer_id)
+                ? 'customer'
+                : null;
+        if (!targetRole) return { allowed: true }; // can't identify counterpart — don't block
+
+        const { data: settings, error: settingsErr } = await supabase
+            .from('partner_chat_settings')
+            .select('chat_with_agent, chat_with_customer')
+            .eq('partner_id', partnerId)
+            .eq('service', service)
+            .maybeSingle();
+
+        if (settingsErr) {
+            console.error('[chatService] resolvePartnerChatPermission settings lookup error:', settingsErr);
+            return { allowed: true };
+        }
+
+        const flag = targetRole === 'agent'
+            ? (settings ? settings.chat_with_agent : true)
+            : (settings ? settings.chat_with_customer : true);
+
+        return flag
+            ? { allowed: true }
+            : { allowed: false, reason: `Chat with ${targetRole === 'agent' ? 'Agent' : 'Customer'} is currently disabled for ${service}.` };
+    },
+
     /**
      * Fetch chat history for a specific extinguisher
      * Parent changed from 'query' to 'extinguisher' per database schema requirements.

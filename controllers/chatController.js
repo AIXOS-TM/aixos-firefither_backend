@@ -115,6 +115,17 @@ const chatController = {
             return res.status(400).json({ success: false, data: null, error: 'sender_id, receiver_id, and message are required.' });
         }
 
+        // Partner Chat Management — a no-op for every role except 'partner' and for
+        // any inquiry outside Maintenance/New Unit/License Renewal (see chatService
+        // for the full resolution). req.user.id (verified JWT) is used as the
+        // partner identity here, never the request body.
+        if (req.user.role === 'partner' && inquiry_id) {
+            const gate = await chatService.resolvePartnerChatPermission(inquiry_id, req.user.id, receiver_id);
+            if (!gate.allowed) {
+                return res.status(403).json({ success: false, data: null, error: gate.reason });
+            }
+        }
+
         try {
             // Map the unified `message` attribute to the existing DB schema `content` column.
             const newMsg = await chatService.createDirectMessage({
@@ -143,6 +154,15 @@ const chatController = {
 
         if (!sender_id || !receiver_id) {
             return res.status(400).json({ success: false, data: null, error: 'sender_id and receiver_id are required in query params.' });
+        }
+
+        // Partner Chat Management — same gate as sending, applied to reading history too.
+        if (req.user.role === 'partner' && inquiry_id) {
+            const otherPartyId = String(sender_id) === String(req.user.id) ? receiver_id : sender_id;
+            const gate = await chatService.resolvePartnerChatPermission(inquiry_id, req.user.id, otherPartyId);
+            if (!gate.allowed) {
+                return res.status(403).json({ success: false, data: null, error: gate.reason });
+            }
         }
 
         try {
