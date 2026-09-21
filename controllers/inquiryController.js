@@ -296,7 +296,7 @@ class InquiryController {
         }
 
         try {
-            const result = await inquiryService.createFullInquiry(inquiryData, items);
+            const result = await inquiryService.createFullInquiry(inquiryData, items, req.user);
             return res.status(201).json({
                 success: true,
                 data: result,
@@ -304,7 +304,7 @@ class InquiryController {
             });
         } catch (error) {
             console.error('[InquiryController] createInquiry error:', error);
-            return res.status(500).json({
+            return res.status(error.status || 500).json({
                 success: false,
                 data: null,
                 error: `Failed to create inquiry: ${error.message}`

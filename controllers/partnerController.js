@@ -205,10 +205,12 @@ class PartnerController {
             });
         } catch (error) {
             console.error('[PartnerController] updateMyServiceAvailability error:', error);
-            return res.status(500).json({
+            // error.status is set for the "Admin has disabled this" rejection (403) —
+            // everything else stays a generic 500.
+            return res.status(error.status || 500).json({
                 success: false,
                 data: null,
-                error: `Failed to update service availability: ${error.message}`
+                error: error.status ? error.message : `Failed to update service availability: ${error.message}`
             });
         }
     }

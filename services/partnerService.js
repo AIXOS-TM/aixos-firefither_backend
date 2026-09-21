@@ -134,7 +134,7 @@ class PartnerService {
         try {
             const { data, error } = await supabase
                 .from('partner_service_availability')
-                .select('service_type, service_subtype, is_enabled')
+                .select('service_type, service_subtype, is_enabled, admin_enabled')
                 .eq('partner_id', partnerId);
 
             if (error) throw error;
@@ -153,6 +153,32 @@ class PartnerService {
     async updateServiceAvailability(partnerId, updates) {
         if (!Array.isArray(updates) || updates.length === 0) {
             throw new Error('At least one service update is required.');
+        }
+
+        // Admin's per-partner override always wins — a Partner can never turn a service back
+        // ON that Admin has explicitly disabled for them specifically (missing row = Admin
+        // hasn't restricted it, so admin_enabled defaults to true there).
+        const turningOn = updates.filter((u) => u.is_enabled === true);
+        if (turningOn.length > 0) {
+            const { data: existingRows, error: lookupErr } = await supabase
+                .from('partner_service_availability')
+                .select('service_type, service_subtype, admin_enabled')
+                .eq('partner_id', partnerId);
+            if (lookupErr) {
+                console.error('[PartnerService] updateServiceAvailability admin_enabled lookup error:', lookupErr);
+                throw new Error(`Unable to update service availability: ${lookupErr.message}`);
+            }
+            for (const u of turningOn) {
+                const subtype = u.service_subtype || 'default';
+                const existing = (existingRows || []).find(
+                    (r) => r.service_type === u.service_type && r.service_subtype === subtype
+                );
+                if (existing && existing.admin_enabled === false) {
+                    const err = new Error(`This service (${u.service_type} ${subtype}) has been disabled by Admin and cannot be re-enabled.`);
+                    err.status = 403;
+                    throw err;
+                }
+            }
         }
 
         const rows = updates.map((u) => ({

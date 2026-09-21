@@ -268,8 +268,80 @@ class InquiryService {
      * Create a full inquiry with its associated items and extinguishers.
      * Sequence: Inquiry -> Extinguisher -> Inquiry Item
      */
-    async createFullInquiry(inquiryData, items) {
+    async createFullInquiry(inquiryData, items, actingUser = {}) {
         try {
+            // Trust the verified JWT for agent attribution rather than a client-supplied
+            // agent_id — nothing previously stopped one agent's token from creating an
+            // inquiry attributed to a different agent_id.
+            if (actingUser.role === 'agent') {
+                inquiryData = { ...inquiryData, agent_id: actingUser.id };
+            }
+
+            if (inquiryData.partner_id) {
+                const { data: partner, error: partnerErr } = await supabase
+                    .from('partners')
+                    .select('id, status')
+                    .eq('id', inquiryData.partner_id)
+                    .maybeSingle();
+                if (partnerErr) throw partnerErr;
+                if (!partner || partner.status !== 'Active') {
+                    const err = new Error('Selected Partner is not available.');
+                    err.status = 400;
+                    throw err;
+                }
+
+                // Defense-in-depth — enforce_inquiry_item_product_assignment (DB trigger)
+                // is the real, unbypassable enforcement; this just gives a clean 409
+                // instead of a raw Postgres exception.
+                const productIds = Array.from(new Set((items || []).map((it) => it.product_id).filter(Boolean)));
+                if (productIds.length > 0) {
+                    const { data: assignedRows, error: assignedErr } = await supabase
+                        .from('partner_products')
+                        .select('product_id')
+                        .eq('partner_id', inquiryData.partner_id)
+                        .in('product_id', productIds);
+                    if (assignedErr) throw assignedErr;
+                    const assignedSet = new Set((assignedRows || []).map((r) => r.product_id));
+                    const unassignedProductId = productIds.find((id) => !assignedSet.has(id));
+                    if (unassignedProductId) {
+                        const err = new Error('One of the selected products is not assigned to this Partner.');
+                        err.status = 409;
+                        throw err;
+                    }
+                }
+
+                // Same defense-in-depth for service availability — enforce_partner_service_availability
+                // (DB trigger) is the real enforcement.
+                const subtype = ['Validation', 'Refill'].includes(inquiryData.type)
+                    ? (items?.[0]?.validation_mode || 'new')
+                    : 'default';
+
+                const [{ data: globalRow }, { data: partnerAvailabilityRow }] = await Promise.all([
+                    supabase.from('service_availability')
+                        .select('is_enabled')
+                        .eq('service_type', inquiryData.type)
+                        .eq('service_subtype', subtype)
+                        .maybeSingle(),
+                    supabase.from('partner_service_availability')
+                        .select('is_enabled, admin_enabled')
+                        .eq('partner_id', inquiryData.partner_id)
+                        .eq('service_type', inquiryData.type)
+                        .eq('service_subtype', subtype)
+                        .maybeSingle(),
+                ]);
+
+                if (globalRow?.is_enabled === false) {
+                    const err = new Error(`${inquiryData.type} ${subtype} service is currently unavailable.`);
+                    err.status = 409;
+                    throw err;
+                }
+                if (partnerAvailabilityRow?.admin_enabled === false || partnerAvailabilityRow?.is_enabled === false) {
+                    const err = new Error('This Partner does not currently offer this service.');
+                    err.status = 409;
+                    throw err;
+                }
+            }
+
             const allHistoryDates = Array.from(new Set([
                 ...(inquiryData.follow_up_history || []),
                 ...(inquiryData.follow_up_date ? [inquiryData.follow_up_date] : [])

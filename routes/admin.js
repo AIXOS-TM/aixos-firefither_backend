@@ -219,6 +219,57 @@ router.put('/service-availability', async (req, res) => {
     }
 });
 
+// ADMIN PER-PARTNER SERVICE CONTROL — a third, more granular layer on top of the global
+// service-availability switch above: Admin overriding one specific Partner's specific
+// service. Additive, not a replacement — see partner_service_availability.admin_enabled
+// (migration 20260916100000). Only ever writes admin_enabled, never the Partner's own
+// is_enabled — same partial-column upsert pattern as the chat-settings route below.
+
+// PUT /api/admin/partners/:partnerId/service-availability
+// { updates: [{ service_type, service_subtype?, admin_enabled }] }
+router.put('/partners/:partnerId/service-availability', async (req, res) => {
+    const { partnerId } = req.params;
+    const updates = Array.isArray(req.body?.updates) ? req.body.updates : null;
+    if (!updates || updates.length === 0) {
+        return res.status(400).json({ success: false, data: null, error: 'updates array is required.' });
+    }
+
+    for (const u of updates) {
+        const subtype = u.service_subtype || 'default';
+        if (!VALID_SERVICE_TYPES.has(u.service_type) || !VALID_SERVICE_SUBTYPES.has(subtype)) {
+            return res.status(400).json({
+                success: false,
+                data: null,
+                error: `Invalid service_type/service_subtype: ${u.service_type}/${subtype}`
+            });
+        }
+        if (u.admin_enabled === undefined) {
+            return res.status(400).json({ success: false, data: null, error: 'admin_enabled is required for each update.' });
+        }
+    }
+
+    const rows = updates.map((u) => ({
+        partner_id: partnerId,
+        service_type: u.service_type,
+        service_subtype: u.service_subtype || 'default',
+        admin_enabled: Boolean(u.admin_enabled),
+        updated_at: new Date().toISOString(),
+    }));
+
+    try {
+        const { data, error } = await supabase
+            .from('partner_service_availability')
+            .upsert(rows, { onConflict: 'partner_id,service_type,service_subtype' })
+            .select('id, service_type, service_subtype, is_enabled, admin_enabled');
+
+        if (error) throw error;
+        res.json({ success: true, data: data || [], error: null });
+    } catch (err) {
+        console.error('[admin] PUT partner service-availability error:', err);
+        res.status(500).json({ success: false, data: null, error: err.message || 'Failed to update partner service availability.' });
+    }
+});
+
 // PARTNER CHAT MANAGEMENT — per-Partner, per-service Chat-with-Agent / Chat-with-Customer
 // switches. Same admin gate (router.use above), same { success, data, error } envelope as
 // the service-availability routes. Scoped to exactly 3 services (no sub-types).
@@ -285,6 +336,129 @@ router.put('/partners/:partnerId/chat-settings', async (req, res) => {
     } catch (err) {
         console.error('[admin] PUT partner chat-settings error:', err);
         res.status(500).json({ success: false, data: null, error: err.message || 'Failed to update chat settings.' });
+    }
+});
+
+// GENERAL INQUIRY ROUTING — which Admin account(s) get notified when an Agent creates a
+// General Inquiry (no Partner offers the selected product/service — see
+// supabase/migrations/20260917100000_general_inquiry_routing_columns.sql). Admin-only
+// management here; the Agent-facing "who do I notify" lookup lives in
+// routes/generalInquiry.js since it must be reachable by any authenticated role, not
+// just admin (this router is blanket-gated to requireRole('admin') above).
+
+// GET /api/admin/general-inquiry-admins
+router.get('/general-inquiry-admins', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('admins')
+            .select('id, name, email, receives_general_inquiries')
+            .order('name', { ascending: true });
+        if (error) throw error;
+        res.json({ success: true, data: data || [], error: null });
+    } catch (err) {
+        console.error('[admin] GET general-inquiry-admins error:', err);
+        res.status(500).json({ success: false, data: null, error: err.message || 'Failed to fetch admins.' });
+    }
+});
+
+// PUT /api/admin/general-inquiry-admins  { updates: [{ admin_id, receives_general_inquiries }] }
+router.put('/general-inquiry-admins', async (req, res) => {
+    const updates = Array.isArray(req.body?.updates) ? req.body.updates : null;
+    if (!updates || updates.length === 0) {
+        return res.status(400).json({ success: false, data: null, error: 'updates array is required.' });
+    }
+
+    try {
+        for (const u of updates) {
+            if (!u?.admin_id || u.receives_general_inquiries === undefined) {
+                return res.status(400).json({ success: false, data: null, error: 'admin_id and receives_general_inquiries are required for each update.' });
+            }
+            const { error } = await supabase
+                .from('admins')
+                .update({ receives_general_inquiries: Boolean(u.receives_general_inquiries) })
+                .eq('id', u.admin_id);
+            if (error) throw error;
+        }
+
+        const { data, error: listErr } = await supabase
+            .from('admins')
+            .select('id, name, email, receives_general_inquiries')
+            .order('name', { ascending: true });
+        if (listErr) throw listErr;
+        res.json({ success: true, data: data || [], error: null });
+    } catch (err) {
+        console.error('[admin] PUT general-inquiry-admins error:', err);
+        res.status(500).json({ success: false, data: null, error: err.message || 'Failed to update General Inquiry routing.' });
+    }
+});
+
+// PUT /api/admin/inquiries/:id/assign-partner  { partner_id }
+// Admin manually routing a General Inquiry (or any unassigned inquiry) to a Partner.
+// This is a deliberate manual override, unlike the Agent's automatic product/service
+// matching (src/utils/productPartnerEligibility.js) — so it does NOT re-check product
+// assignment or service availability. It only enforces what must always hold regardless
+// of who is assigning: the inquiry exists, isn't already assigned (prevents duplicate/
+// racing assignment), and the Partner is a real, Active account. Admin-only is enforced
+// by this router's blanket requireRole('admin') gate above — never just a hidden button.
+router.put('/inquiries/:id/assign-partner', async (req, res) => {
+    const { id } = req.params;
+    const { partner_id: partnerId } = req.body || {};
+    if (!partnerId) {
+        return res.status(400).json({ success: false, data: null, error: 'partner_id is required.' });
+    }
+
+    try {
+        const { data: inquiry, error: inquiryErr } = await supabase
+            .from('inquiries')
+            .select('id, partner_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (inquiryErr) throw inquiryErr;
+        if (!inquiry) {
+            return res.status(404).json({ success: false, data: null, error: 'Inquiry not found.' });
+        }
+        if (inquiry.partner_id) {
+            return res.status(409).json({ success: false, data: null, error: 'This inquiry already has a Partner assigned.' });
+        }
+
+        const { data: partner, error: partnerErr } = await supabase
+            .from('partners')
+            .select('id, status')
+            .eq('id', partnerId)
+            .maybeSingle();
+        if (partnerErr) throw partnerErr;
+        if (!partner || partner.status !== 'Active') {
+            return res.status(400).json({ success: false, data: null, error: 'Partner not found or not active.' });
+        }
+
+        // Conditioned on partner_id still being NULL — closes the race window between
+        // the check above and this write (two concurrent assign requests can't both win).
+        const { data: updated, error: updateErr } = await supabase
+            .from('inquiries')
+            .update({ partner_id: partnerId })
+            .eq('id', id)
+            .is('partner_id', null)
+            .select()
+            .maybeSingle();
+        if (updateErr) throw updateErr;
+        if (!updated) {
+            return res.status(409).json({ success: false, data: null, error: 'This inquiry already has a Partner assigned.' });
+        }
+
+        await supabase.from('notifications').insert([{
+            sender_role: 'Admin',
+            recipient_id: String(partnerId),
+            recipient_role: 'Partner',
+            message: 'An Admin has assigned a General Inquiry to you. Please review and respond.',
+            inquiry_id: id,
+            type: 'general_inquiry_assigned',
+            title: 'New Inquiry Assigned',
+        }]);
+
+        res.json({ success: true, data: updated, error: null });
+    } catch (err) {
+        console.error('[admin] PUT inquiries/:id/assign-partner error:', err);
+        res.status(500).json({ success: false, data: null, error: err.message || 'Failed to assign partner.' });
     }
 });
 
