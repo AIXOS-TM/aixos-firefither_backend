@@ -410,7 +410,7 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
     try {
         const { data: inquiry, error: inquiryErr } = await supabase
             .from('inquiries')
-            .select('id, partner_id')
+            .select('id, type, partner_id')
             .eq('id', id)
             .maybeSingle();
         if (inquiryErr) throw inquiryErr;
@@ -445,11 +445,26 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
             return res.status(409).json({ success: false, data: null, error: 'This inquiry already has a Partner assigned.' });
         }
 
+        // Mirrors src/utils/productPartnerEligibility.js's inquiryTypeLabel on the
+        // frontend — kept in sync there since this is a separate Node runtime.
+        const { data: firstItem } = await supabase
+            .from('inquiry_items')
+            .select('validation_mode')
+            .eq('inquiry_id', id)
+            .limit(1)
+            .maybeSingle();
+        const SUBTYPE_LABELS = {
+            Validation: { new: 'New Validation', followup: 'Follow-up', 'license-renewal': 'License Renewal' },
+            Refill: { new: 'New Refill', followup: 'Follow-up', 'license-renewal': 'License Renewal' },
+        };
+        const subtypeLabel = SUBTYPE_LABELS[inquiry.type]?.[firstItem?.validation_mode || 'new'];
+        const typeLabel = subtypeLabel ? `${inquiry.type} - ${subtypeLabel}` : inquiry.type;
+
         await supabase.from('notifications').insert([{
             sender_role: 'Admin',
             recipient_id: String(partnerId),
             recipient_role: 'Partner',
-            message: 'An Admin has assigned a General Inquiry to you. Please review and respond.',
+            message: `New ${typeLabel} inquiry has been assigned to you.`,
             inquiry_id: id,
             type: 'general_inquiry_assigned',
             title: 'New Inquiry Assigned',
