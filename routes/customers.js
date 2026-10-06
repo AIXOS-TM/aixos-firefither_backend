@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../supabase');
 const { verifyToken } = require('../middleware/auth');
+const { requireRole } = require('../middleware/requireRole');
 
 /**
  * Customers table uses location_lat / location_lng (not lat / lng).
@@ -82,6 +83,24 @@ router.patch('/:id/location', verifyToken, async (req, res) => {
             data: null,
             error: err.message || 'Failed to update location'
         });
+    }
+});
+
+// GET /api/customers/me/items — the logged-in customer's equipment (inquiry_items),
+// scoped to the verified JWT so the browser no longer reads the table with the anon key.
+router.get('/me/items', verifyToken, requireRole('customer'), async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('inquiry_items')
+            .select('id, inquiry_id, extinguisher_id, type, capacity, system_type, status, condition, install_date, expiry_date, validation_mode, created_at, updated_at')
+            .eq('customer_id', req.user.id)
+            .order('updated_at', { ascending: false });
+
+        if (error) throw error;
+        return res.status(200).json({ success: true, data: data || [], error: null });
+    } catch (err) {
+        console.error('[customers] GET /me/items error:', err);
+        return res.status(500).json({ success: false, data: null, error: err.message || 'Failed to load equipment.' });
     }
 });
 

@@ -1,4 +1,6 @@
 const inquiryService = require('../services/inquiryService');
+const supabase = require('../supabase');
+const { CUSTOMER_DOCUMENT_PREFIX } = inquiryService;
 
 /**
  * Inquiry Controller
@@ -84,6 +86,120 @@ class InquiryController {
     }
 
     /**
+     * Reference data for the inquiry-create form (partners, service availability,
+     * active products, product↔partner assignments).
+     */
+    async getInquiryFormOptions(req, res) {
+        if (!['customer', 'agent', 'admin'].includes(req.user?.role)) {
+            return res.status(403).json({ success: false, data: null, error: 'Access denied.' });
+        }
+        try {
+            const data = await inquiryService.getInquiryFormOptions(req.user.role);
+            return res.status(200).json({ success: true, data, error: null });
+        } catch (error) {
+            console.error('[InquiryController] getInquiryFormOptions error:', error);
+            return res.status(500).json({ success: false, data: null, error: error.message });
+        }
+    }
+
+    /**
+     * Customer product lookup by CAT# (their own items' catalog_no) or Product# (model_number).
+     */
+    async lookupProduct(req, res) {
+        if (req.user?.role !== 'customer') {
+            return res.status(403).json({ success: false, data: null, error: 'Access denied.' });
+        }
+        const code = String(req.query.code || '').trim();
+        if (!code) {
+            return res.status(400).json({ success: false, data: null, error: 'Enter a CAT# or Product#.' });
+        }
+        try {
+            const data = await inquiryService.lookupProductByCode(code, req.user.id);
+            return res.status(200).json({ success: true, data, error: null });
+        } catch (error) {
+            console.error('[InquiryController] lookupProduct error:', error);
+            return res.status(500).json({ success: false, data: null, error: error.message });
+        }
+    }
+
+    /**
+     * License document for a License Renewal request. Stored in the same bucket/folder
+     * the Agent flow uses (photo-references/licenses), uploaded server-side.
+     */
+    async uploadLicenseDocument(req, res) {
+        if (!['customer', 'agent', 'admin'].includes(req.user?.role)) {
+            return res.status(403).json({ success: false, data: null, error: 'Access denied.' });
+        }
+        const file = req.file;
+        if (!file || !file.buffer) {
+            return res.status(400).json({ success: false, data: null, error: 'No file uploaded.' });
+        }
+        try {
+            const ext = (file.originalname.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+            const filePath = `licenses/license-${req.user.role}-${req.user.id}-${Date.now()}.${ext}`;
+            const { error: uploadError } = await supabase.storage
+                .from('photo-references')
+                .upload(filePath, file.buffer, { contentType: file.mimetype, upsert: false });
+            if (uploadError) throw uploadError;
+            const { data: urlData } = supabase.storage.from('photo-references').getPublicUrl(filePath);
+            return res.status(201).json({ success: true, data: { url: urlData?.publicUrl || null }, error: null });
+        } catch (error) {
+            console.error('[InquiryController] uploadLicenseDocument error:', error);
+            return res.status(500).json({ success: false, data: null, error: `Failed to upload document: ${error.message}` });
+        }
+    }
+
+    /**
+     * Optional PDF a customer attaches to a Validation request. Stored under a path tied
+     * to the customer's id, which createCustomerInquiry checks before saving the URL.
+     */
+    async uploadCustomerDocument(req, res) {
+        if (req.user?.role !== 'customer') {
+            return res.status(403).json({ success: false, data: null, error: 'Access denied.' });
+        }
+        const file = req.file;
+        if (!file || !file.buffer) {
+            return res.status(400).json({ success: false, data: null, error: 'No file uploaded.' });
+        }
+        // Content check, not just the browser-reported type.
+        if (file.buffer.subarray(0, 5).toString('latin1') !== '%PDF-') {
+            return res.status(400).json({ success: false, data: null, error: 'The file is not a valid PDF.' });
+        }
+        try {
+            const filePath = `${CUSTOMER_DOCUMENT_PREFIX}customer-${req.user.id}-${Date.now()}.pdf`;
+            const { error: uploadError } = await supabase.storage
+                .from('photo-references')
+                .upload(filePath, file.buffer, { contentType: 'application/pdf', upsert: false });
+            if (uploadError) throw uploadError;
+            const { data: urlData } = supabase.storage.from('photo-references').getPublicUrl(filePath);
+            return res.status(201).json({
+                success: true,
+                data: { url: urlData?.publicUrl || null, name: file.originalname },
+                error: null
+            });
+        } catch (error) {
+            console.error('[InquiryController] uploadCustomerDocument error:', error);
+            return res.status(500).json({ success: false, data: null, error: `Failed to upload document: ${error.message}` });
+        }
+    }
+
+    /**
+     * Event timeline for one inquiry (owning customer, assigned partner, admin).
+     */
+    async getInquiryEvents(req, res) {
+        try {
+            const result = await inquiryService.getInquiryEvents(req.params.id, req.user);
+            if (!result.ok) {
+                return res.status(result.code).json({ success: false, data: null, error: result.message });
+            }
+            return res.status(200).json({ success: true, data: result.data, error: null });
+        } catch (error) {
+            console.error('[InquiryController] getInquiryEvents error:', error);
+            return res.status(500).json({ success: false, data: null, error: error.message });
+        }
+    }
+
+    /**
      * Update inquiry details (e.g., status).
      */
     async updateInquiry(req, res) {
@@ -101,7 +217,7 @@ class InquiryController {
 
         try {
             const partnerId = role === 'partner' ? userId : null;
-            const updated = await inquiryService.updateInquiry(id, updates, partnerId);
+            const updated = await inquiryService.updateInquiry(id, updates, partnerId, { id: userId, role });
             if (!updated) {
                 return res.status(404).json({
                     success: false,
@@ -296,7 +412,12 @@ class InquiryController {
         }
 
         try {
-            const result = await inquiryService.createFullInquiry(inquiryData, items, req.user);
+            // Customers get their own path (identity from the JWT, Admin-first routing —
+            // any partner_id/customer_id in the body is ignored); every other caller keeps
+            // the existing behaviour unchanged.
+            const result = req.user?.role === 'customer'
+                ? await inquiryService.createCustomerInquiry(inquiryData, items, req.user)
+                : await inquiryService.createFullInquiry(inquiryData, items, req.user);
             return res.status(201).json({
                 success: true,
                 data: result,

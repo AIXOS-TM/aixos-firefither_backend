@@ -17,17 +17,67 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
+// License documents for License Renewal requests — kept in memory and pushed to
+// Supabase Storage by the controller (images or PDF, max 5MB).
+const licenseUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') cb(null, true);
+        else cb(new Error('Only image or PDF files are allowed.'));
+    }
+});
+
 /**
  * 2. Inquiry APIs
  */
 // GET /api/inquiries
 router.get('/inquiries', verifyToken, inquiryController.getInquiries);
 
+// GET /api/inquiries/form-options — must stay above /inquiries/:id
+router.get('/inquiries/form-options', verifyToken, inquiryController.getInquiryFormOptions);
+
+// GET /api/inquiries/product-lookup?code=... — customer CAT# / Product# lookup (above /inquiries/:id)
+router.get('/inquiries/product-lookup', verifyToken, inquiryController.lookupProduct);
+
+// POST /api/inquiries/license-document
+router.post('/inquiries/license-document', verifyToken, (req, res) => {
+    licenseUpload.single('file')(req, res, (err) => {
+        if (err) {
+            const message = err.code === 'LIMIT_FILE_SIZE' ? 'File must be 5MB or smaller.' : err.message;
+            return res.status(400).json({ success: false, data: null, error: message });
+        }
+        inquiryController.uploadLicenseDocument(req, res);
+    });
+});
+
+// POST /api/inquiries/customer-document — optional PDF a customer attaches to a Validation request
+const customerDocumentUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/pdf') cb(null, true);
+        else cb(new Error('Only PDF files are allowed.'));
+    }
+});
+router.post('/inquiries/customer-document', verifyToken, (req, res) => {
+    customerDocumentUpload.single('file')(req, res, (err) => {
+        if (err) {
+            const message = err.code === 'LIMIT_FILE_SIZE' ? 'File must be 5MB or smaller.' : err.message;
+            return res.status(400).json({ success: false, data: null, error: message });
+        }
+        inquiryController.uploadCustomerDocument(req, res);
+    });
+});
+
 // POST /api/inquiries
 router.post('/inquiries', verifyToken, inquiryController.createInquiry);
 
 // GET /api/inquiries/:id
 router.get('/inquiries/:id', verifyToken, inquiryController.getInquiryById);
+
+// GET /api/inquiries/:id/events — timeline (inquiry_events), oldest first
+router.get('/inquiries/:id/events', verifyToken, inquiryController.getInquiryEvents);
 
 // PATCH /api/inquiries/:id
 router.patch('/inquiries/:id', verifyToken, inquiryController.updateInquiry);

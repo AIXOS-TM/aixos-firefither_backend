@@ -3,6 +3,9 @@ const router = express.Router();
 const supabase = require('../supabase');
 const { verifyToken } = require('../middleware/auth');
 const { requireRole } = require('../middleware/requireRole');
+const { recordInquiryEvent } = require('../services/inquiryEvents');
+const inquiryService = require('../services/inquiryService');
+const agentStatus = require('../services/agentStatus');
 
 // Every route in this file is admin-only.
 router.use(verifyToken, requireRole('admin'));
@@ -392,6 +395,39 @@ router.put('/general-inquiry-admins', async (req, res) => {
     }
 });
 
+// PATCH /api/admin/agents/:id/status  { status: pending | accepted | rejected | hold }
+// When an active Agent becomes inactive (left / on hold / rejected), their open inquiries
+// are routed to Admin for reassignment — see services/agentStatus.js.
+router.patch('/agents/:id/status', async (req, res) => {
+    try {
+        const result = await agentStatus.setAgentStatus(req.params.id, req.body?.status, req.user);
+        if (!result.ok) {
+            return res.status(result.code).json({ success: false, data: null, error: result.message });
+        }
+        res.json({ success: true, data: result.data, error: null });
+    } catch (err) {
+        console.error('[admin] PATCH agents/:id/status error:', err);
+        res.status(500).json({ success: false, data: null, error: err.message || 'Failed to update agent.' });
+    }
+});
+
+// PUT /api/admin/inquiries/:id/assign-agent  { agent_id }
+// Admin assigns an active Agent to a customer request that has none (self-created
+// customer, or creating Agent inactive), or reassigns any inquiry whose current Agent is
+// no longer active. An inquiry with an active Agent is not reassigned here (409).
+router.put('/inquiries/:id/assign-agent', async (req, res) => {
+    try {
+        const result = await inquiryService.assignAgentToCustomerRequest(req.params.id, req.body?.agent_id, req.user);
+        if (!result.ok) {
+            return res.status(result.code).json({ success: false, data: null, error: result.message });
+        }
+        res.json({ success: true, data: result.data, error: null });
+    } catch (err) {
+        console.error('[admin] PUT inquiries/:id/assign-agent error:', err);
+        res.status(500).json({ success: false, data: null, error: err.message || 'Failed to assign agent.' });
+    }
+});
+
 // PUT /api/admin/inquiries/:id/assign-partner  { partner_id }
 // Admin manually routing a General Inquiry (or any unassigned inquiry) to a Partner.
 // This is a deliberate manual override, unlike the Agent's automatic product/service
@@ -410,7 +446,7 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
     try {
         const { data: inquiry, error: inquiryErr } = await supabase
             .from('inquiries')
-            .select('id, type, partner_id')
+            .select('id, inquiry_no, type, status, customer_id, partner_id, performed_by')
             .eq('id', id)
             .maybeSingle();
         if (inquiryErr) throw inquiryErr;
@@ -431,6 +467,16 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
             return res.status(400).json({ success: false, data: null, error: 'Partner not found or not active.' });
         }
 
+        // Customer requests reach a Partner only through this route, so the Partner must
+        // actually be eligible (service availability + product assignment) — unlike the
+        // manual override above for Agent-created General Inquiries, which is unchanged.
+        if (String(inquiry.performed_by || '').trim().toLowerCase() === 'customer') {
+            const reason = await inquiryService.getPartnerIneligibilityReason(id, inquiry.type, partnerId);
+            if (reason) {
+                return res.status(409).json({ success: false, data: null, error: reason });
+            }
+        }
+
         // Conditioned on partner_id still being NULL — closes the race window between
         // the check above and this write (two concurrent assign requests can't both win).
         const { data: updated, error: updateErr } = await supabase
@@ -443,6 +489,26 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
         if (updateErr) throw updateErr;
         if (!updated) {
             return res.status(409).json({ success: false, data: null, error: 'This inquiry already has a Partner assigned.' });
+        }
+
+        await recordInquiryEvent({
+            inquiryId: id,
+            eventType: 'partner_assigned',
+            actor: { id: req.user.id, role: req.user.role },
+            metadata: { source: 'admin_assign', partner_id: partnerId },
+        });
+
+        // A customer's Validation request is approved as soon as Admin assigns a Partner
+        // (until then it stays 'pending'). Goes through updateInquiry so the normal
+        // pending -> accepted transition rule applies and the timeline records it.
+        const isCustomerRequest = String(inquiry.performed_by || '').trim().toLowerCase() === 'customer';
+        const autoApprove = isCustomerRequest
+            && String(inquiry.type || '').trim().toLowerCase() === 'validation'
+            && String(inquiry.status || 'pending').trim().toLowerCase() === 'pending';
+        let result = updated;
+        if (autoApprove) {
+            const approved = await inquiryService.updateInquiry(id, { status: 'accepted' }, partnerId, { id: req.user.id, role: req.user.role });
+            if (approved) result = approved;
         }
 
         // Mirrors src/utils/productPartnerEligibility.js's inquiryTypeLabel on the
@@ -460,17 +526,31 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
         const subtypeLabel = SUBTYPE_LABELS[inquiry.type]?.[firstItem?.validation_mode || 'new'];
         const typeLabel = subtypeLabel ? `${inquiry.type} - ${subtypeLabel}` : inquiry.type;
 
-        await supabase.from('notifications').insert([{
+        const notifications = [{
             sender_role: 'Admin',
             recipient_id: String(partnerId),
             recipient_role: 'Partner',
-            message: `New ${typeLabel} inquiry has been assigned to you.`,
+            message: autoApprove
+                ? `New ${typeLabel} inquiry has been assigned to you and approved.`
+                : `New ${typeLabel} inquiry has been assigned to you.`,
             inquiry_id: id,
             type: 'general_inquiry_assigned',
             title: 'New Inquiry Assigned',
-        }]);
+        }];
+        if (autoApprove && inquiry.customer_id != null) {
+            notifications.push({
+                sender_role: 'Admin',
+                recipient_id: String(inquiry.customer_id),
+                recipient_role: 'Customer',
+                message: `Your ${typeLabel} request ${inquiry.inquiry_no || ''} has been approved and assigned to a service partner.`.replace(/\s+/g, ' '),
+                inquiry_id: id,
+                type: 'validation_approved',
+                title: 'Validation approved',
+            });
+        }
+        await supabase.from('notifications').insert(notifications);
 
-        res.json({ success: true, data: updated, error: null });
+        res.json({ success: true, data: result, error: null });
     } catch (err) {
         console.error('[admin] PUT inquiries/:id/assign-partner error:', err);
         res.status(500).json({ success: false, data: null, error: err.message || 'Failed to assign partner.' });

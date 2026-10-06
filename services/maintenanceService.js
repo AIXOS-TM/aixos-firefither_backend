@@ -1,5 +1,7 @@
 const supabase = require('../supabase');
 const { isRenewalOnlyInquiry } = require('./renewalHelpers');
+const { recordInquiryEvent } = require('./inquiryEvents');
+const { isActiveAgentStatus, adminRecipientIds } = require('./agentStatus');
 
 const INSPECTION_BUCKET = 'inspection-reports';
 const QUOTATION_BUCKET = 'quotations';
@@ -12,7 +14,7 @@ class MaintenanceService {
     async getInquiryAccessRow(inquiryId) {
         const { data, error } = await supabase
             .from('inquiries')
-            .select('id, partner_id, customer_id, status, type')
+            .select('id, inquiry_no, partner_id, customer_id, agent_id, status, type')
             .eq('id', inquiryId)
             .maybeSingle();
         if (error) throw error;
@@ -41,6 +43,34 @@ class MaintenanceService {
 
         const { delivery_mode, pickup_date, delivery_date, items } = payload;
         const currentStatus = (inquiry.status || '').toLowerCase();
+
+        // Maintenance / New Unit have no pickup or delivery step (that "don't auto-accept
+        // until the Agent confirms delivery" rule below is Refill's): the Partner's Accept
+        // moves the inquiry straight to 'accepted', which opens the site assessment /
+        // inspection / visit / quotation workflow.
+        const typeKey = String(inquiry.type || '').trim().toLowerCase();
+        if (typeKey === 'maintenance' || typeKey === 'new unit') {
+            if (currentStatus !== 'pending') {
+                return { ok: false, code: 409, message: `Only a pending inquiry can be accepted (it is ${currentStatus || 'unknown'}).` };
+            }
+            const { data, error } = await supabase
+                .from('inquiries')
+                .update({ status: 'accepted', updated_at: new Date().toISOString() })
+                .eq('id', inquiryId)
+                .eq('status', inquiry.status)
+                .select()
+                .maybeSingle();
+            if (error) throw error;
+            if (!data) return { ok: false, code: 409, message: 'This inquiry changed meanwhile. Reload and try again.' };
+            await recordInquiryEvent({
+                inquiryId,
+                eventType: 'status_changed',
+                fromStatus: inquiry.status,
+                toStatus: 'accepted',
+                actor: { id: partnerId, role: 'partner' },
+            });
+            return { ok: true, data };
+        }
 
         // 1. Update items if provided (Persistence for Problem 1)
         if (Array.isArray(items) && items.length > 0) {
@@ -87,17 +117,52 @@ class MaintenanceService {
 
         if (error) throw error;
 
-        // 3. Notify agent if dates were proposed
+        await recordInquiryEvent({
+            inquiryId,
+            eventType: isProposing
+                ? 'delivery_proposed'
+                : delivery_mode === 'agent'
+                    ? 'delivery_assigned_to_agent'
+                    : 'items_accepted',
+            fromStatus: inquiry.status,
+            toStatus: data?.status ?? inquiry.status,
+            actor: { id: partnerId, role: 'partner' },
+            metadata: {
+                delivery_mode: updateData.delivery_mode || null,
+                pickup_date: updateData.pickup_date || null,
+                delivery_date: updateData.delivery_date || null,
+                items: Array.isArray(items) ? items.map((it) => ({ id: it.id, accepted_quantity: it.accepted_quantity })) : [],
+            },
+        });
+
+        // 3. Notify agent if dates were proposed — or Admin, when the inquiry has no
+        //    active Agent (none yet, or they left / are on hold), so it isn't left unseen.
         if (isProposing) {
-            await supabase.from('notifications').insert({
-                sender_id: String(partnerId),
-                sender_role: 'partner',
-                recipient_id: String(inquiry.agent_id),
-                recipient_role: 'agent',
-                message: `Partner proposed pickup date for inquiry ${inquiryId}`,
-                type: "pickup_date_submitted",
-                inquiry_id: inquiryId
-            });
+            const { data: agentRow } = inquiry.agent_id != null
+                ? await supabase.from('agents').select('status').eq('id', inquiry.agent_id).maybeSingle()
+                : { data: null };
+            if (agentRow && isActiveAgentStatus(agentRow.status)) {
+                await supabase.from('notifications').insert({
+                    sender_id: String(partnerId),
+                    sender_role: 'partner',
+                    recipient_id: String(inquiry.agent_id),
+                    recipient_role: 'agent',
+                    message: `Partner proposed pickup date for inquiry ${inquiryId}`,
+                    type: "pickup_date_submitted",
+                    inquiry_id: inquiryId
+                });
+            } else {
+                const rows = (await adminRecipientIds().catch(() => [])).map((id) => ({
+                    sender_id: String(partnerId),
+                    sender_role: 'partner',
+                    recipient_id: id,
+                    recipient_role: 'Admin',
+                    message: `Partner proposed pickup date for inquiry ${inquiry.inquiry_no || inquiryId}, which has no active Agent. Please assign one.`,
+                    type: "pickup_date_submitted",
+                    inquiry_id: inquiryId
+                }));
+                if (rows.length > 0) await supabase.from('notifications').insert(rows);
+            }
         }
 
         return { ok: true, data };
@@ -135,6 +200,16 @@ class MaintenanceService {
             .single();
 
         if (error) throw error;
+
+        await recordInquiryEvent({
+            inquiryId,
+            eventType: 'status_changed',
+            fromStatus: inquiry.data.status,
+            toStatus: data.status,
+            actor: { id: partnerId, role: 'partner' },
+            metadata: { source: 'final_accept', delivery_status: data.delivery_status },
+        });
+
         return { ok: true, data };
     }
 
@@ -165,7 +240,14 @@ class MaintenanceService {
             .maybeSingle();
 
         if (error) throw error;
-        
+
+        await recordInquiryEvent({
+            inquiryId: inquiry_id,
+            eventType: 'visit_scheduled',
+            actor: { id: partnerId, role: 'partner' },
+            metadata: { scheduled_date },
+        });
+
         // Notification to customer
         await supabase.from('notifications').insert({
             sender_id: String(partnerId),
@@ -213,8 +295,15 @@ class MaintenanceService {
 
         if (error) throw error;
 
-        // Notification to partner
         const isApproved = status === 'approved';
+        await recordInquiryEvent({
+            inquiryId: inquiry_id,
+            eventType: isApproved ? 'visit_approved' : 'visit_rejected',
+            actor: { id: userId, role },
+            metadata: { scheduled_date: data?.scheduled_date ?? null },
+        });
+
+        // Notification to partner
         await supabase.from('notifications').insert({
             sender_id: String(userId),
             sender_role: role,
@@ -481,7 +570,16 @@ class MaintenanceService {
         if (error) throw error;
 
         // 3. Update inquiry status
-        await supabase.from('inquiries').update({ status: 'quoted' }).eq('id', inquiryId);
+        const { error: statusErr } = await supabase.from('inquiries').update({ status: 'quoted' }).eq('id', inquiryId);
+
+        await recordInquiryEvent({
+            inquiryId,
+            eventType: 'quotation_sent',
+            fromStatus: inquiry.status,
+            toStatus: statusErr ? inquiry.status : 'quoted',
+            actor: { id: partnerId, role: 'partner' },
+            metadata: { quotation_id: data.id, estimated_cost: cost },
+        });
 
         // 4. Notify customer
         await supabase.from('notifications').insert({
@@ -512,7 +610,7 @@ class MaintenanceService {
     async listQuotationsForCustomer(customerId) {
         const { data, error } = await supabase
             .from('quotations')
-            .select('*, inquiries(type, status)')
+            .select('*, inquiries(inquiry_no, type, status)')
             .eq('customer_id', customerId)
             .order('created_at', { ascending: false });
 
@@ -532,6 +630,17 @@ class MaintenanceService {
         // Only owning customer can approve/reject
         if (user.role === 'customer' && String(existing.customer_id) !== String(user.id)) {
             return { ok: false, code: 403, message: 'Access denied.' };
+        }
+        // A customer's only decisions are approve/reject, and only while the quotation
+        // is still awaiting them (same statuses the customer UI offers the actions for).
+        if (user.role === 'customer') {
+            if (status !== 'approved' && status !== 'rejected') {
+                return { ok: false, code: 400, message: 'Customers can only approve or reject a quotation.' };
+            }
+            const current = String(existing.status || '').trim().toLowerCase();
+            if (!['pending', 'submitted', 'sent'].includes(current)) {
+                return { ok: false, code: 409, message: `This quotation is already ${existing.status}.` };
+            }
         }
 
         const { data, error } = await supabase
@@ -558,12 +667,35 @@ class MaintenanceService {
         // Renewal-specific: once the customer approves the quotation, the Renewal is
         // done — auto-complete it (nothing else in the app auto-completes on quotation
         // approval, so this is Renewal's own rule, not a change to Maintenance's).
-        if (status === 'approved' && await isRenewalOnlyInquiry(supabase, existing.inquiry_id)) {
-            await supabase
+        // One event for the whole action; when the renewal auto-completes, the event
+        // also carries that status transition.
+        let fromStatus = null;
+        let toStatus = null;
+        const renewalAutoComplete = status === 'approved' && await isRenewalOnlyInquiry(supabase, existing.inquiry_id);
+        if (renewalAutoComplete) {
+            const before = await this.getInquiryAccessRow(existing.inquiry_id).catch(() => null);
+            const { error: completeErr } = await supabase
                 .from('inquiries')
                 .update({ status: 'completed', updated_at: new Date().toISOString() })
                 .eq('id', existing.inquiry_id);
+            fromStatus = before?.status ?? null;
+            toStatus = completeErr ? fromStatus : 'completed';
+        }
 
+        await recordInquiryEvent({
+            inquiryId: existing.inquiry_id,
+            eventType: status === 'approved'
+                ? 'quotation_approved'
+                : status === 'rejected'
+                    ? 'quotation_rejected'
+                    : 'quotation_updated',
+            fromStatus,
+            toStatus,
+            actor: { id: user.id, role: user.role },
+            metadata: { quotation_id: existing.id, quotation_status: status, previous_quotation_status: existing.status ?? null },
+        });
+
+        if (renewalAutoComplete) {
             await supabase.from('notifications').insert({
                 sender_id: String(user.id),
                 sender_role: user.role,
@@ -596,6 +728,13 @@ class MaintenanceService {
         if (error) throw error;
         if (!data) return { ok: false, code: 404, message: 'Inquiry not found or not assigned to you.' };
 
+        await recordInquiryEvent({
+            inquiryId,
+            eventType: 'delivery_confirmed',
+            actor: { id: agentId, role: 'agent' },
+            metadata: { pickup_date: data.pickup_date ?? null, delivery_date: data.delivery_date ?? null },
+        });
+
         // Notify partner
         await supabase.from('notifications').insert({
             sender_id: String(agentId),
@@ -627,6 +766,13 @@ class MaintenanceService {
         if (error) throw error;
         if (!data) return { ok: false, code: 404, message: 'Inquiry not found or not assigned to you.' };
 
+        await recordInquiryEvent({
+            inquiryId,
+            eventType: 'delivery_rejected',
+            actor: { id: agentId, role: 'agent' },
+            metadata: { pickup_date: data.pickup_date ?? null, delivery_date: data.delivery_date ?? null },
+        });
+
         // Notify partner
         await supabase.from('notifications').insert({
             sender_id: String(agentId),
@@ -649,13 +795,17 @@ class MaintenanceService {
 
         const { data: oldData, error: fetchErr } = await supabase
             .from('inquiries')
-            .select('partner_id, agent_id')
+            .select('partner_id, agent_id, status, performed_by')
             .eq('id', inquiryId)
             .single();
 
         if (fetchErr) throw fetchErr;
         if (String(oldData.agent_id) !== String(agentId)) {
             return { ok: false, code: 403, message: 'Only the assigned agent can switch partners.' };
+        }
+        // A customer request is only referred to its Agent; the Partner is chosen by Admin.
+        if (String(oldData.performed_by || '').trim().toLowerCase() === 'customer') {
+            return { ok: false, code: 403, message: 'Partner assignment for customer requests is handled by Admin.' };
         }
 
         const oldPartnerId = oldData.partner_id;
@@ -676,6 +826,15 @@ class MaintenanceService {
             .maybeSingle();
 
         if (error) throw error;
+
+        await recordInquiryEvent({
+            inquiryId,
+            eventType: 'partner_assigned',
+            fromStatus: oldData.status ?? null,
+            toStatus: data?.status ?? null,
+            actor: { id: agentId, role: 'agent' },
+            metadata: { source: 'switch_partner', partner_id: new_partner_id, previous_partner_id: oldPartnerId ?? null, reason: reason || null },
+        });
 
         // Notify old partner
         if (oldPartnerId) {
