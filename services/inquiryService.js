@@ -576,7 +576,7 @@ class InquiryService {
     async getInquiryFormOptions(role = null) {
         const productsQuery = supabase
             .from('products')
-            .select('id, name, model_number, description, specifications, image_url, is_active, categories(name)')
+            .select('id, name, cat_no, model_number, description, specifications, image_url, is_active, categories(name)')
             .eq('is_active', true);
         const globalQuery = supabase.from('service_availability').select('service_type, service_subtype, is_enabled');
 

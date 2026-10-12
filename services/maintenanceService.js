@@ -2,6 +2,7 @@ const supabase = require('../supabase');
 const { isRenewalOnlyInquiry } = require('./renewalHelpers');
 const { recordInquiryEvent } = require('./inquiryEvents');
 const { isActiveAgentStatus, adminRecipientIds } = require('./agentStatus');
+const { formatKsaDateTime } = require('./dateTime');
 
 const INSPECTION_BUCKET = 'inspection-reports';
 const QUOTATION_BUCKET = 'quotations';
@@ -254,7 +255,7 @@ class MaintenanceService {
             sender_role: 'partner',
             recipient_id: String(inquiry.customer_id),
             recipient_role: 'customer',
-            message: `Your site visit is scheduled for ${new Date(scheduled_date).toLocaleString()}. Please review and approve.`,
+            message: `Your site visit is scheduled for ${formatKsaDateTime(scheduled_date) || scheduled_date}. Please review and approve.`,
             inquiry_id
         });
 

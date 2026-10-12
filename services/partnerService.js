@@ -87,7 +87,7 @@ class PartnerService {
         try {
             const { data, error } = await supabase
                 .from('partner_products')
-                .select('id, assigned_at, products(id, name, model_number, description, specifications, image_url, is_active, categories(id, name))')
+                .select('id, assigned_at, products(id, name, cat_no, model_number, description, specifications, image_url, is_active, categories(id, name))')
                 .eq('partner_id', partnerId)
                 .order('assigned_at', { ascending: false });
 
