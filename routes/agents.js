@@ -3,6 +3,8 @@ const router = express.Router();
 const supabase = require('../supabase');
 const multer = require('multer');
 const path = require('path');
+const { verifyToken } = require('../middleware/auth');
+const { requireRole, requireSelfOrRole } = require('../middleware/requireRole');
 
 // Configure Multer for Visit Photos
 const storage = multer.diskStorage({
@@ -17,8 +19,9 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 // SEARCH CUSTOMERS (for Autocomplete)
-router.get('/customers/search', async (req, res) => {
-    const { query } = req.query;
+router.get('/customers/search', verifyToken, requireRole('agent', 'admin'), async (req, res) => {
+    // Strip PostgREST filter syntax so the term can't add extra .or() conditions.
+    const query = String(req.query.query || '').replace(/[,()*%]/g, ' ').trim();
     if (!query) return res.json([]);
 
     try {
@@ -37,7 +40,7 @@ router.get('/customers/search', async (req, res) => {
 });
 
 // LOG VISIT
-router.post('/visits', upload.any(), async (req, res) => {
+router.post('/visits', verifyToken, requireRole('agent'), upload.any(), async (req, res) => {
     const QRCode = require('qrcode');
     const fs = require('fs');
 
@@ -48,6 +51,10 @@ router.post('/visits', upload.any(), async (req, res) => {
         notes, risk_assessment, service_recommendations, follow_up_date,
         inventory
     } = req.body;
+
+    if (agent_id != null && agent_id !== '' && String(agent_id) !== String(req.user.id)) {
+        return res.status(403).json({ error: 'You can only log visits as yourself.' });
+    }
 
     try {
         let finalCustId = customer_id;
@@ -134,7 +141,7 @@ router.post('/visits', upload.any(), async (req, res) => {
 });
 
 // Get Agent Stats
-router.get('/:id/stats', async (req, res) => {
+router.get('/:id/stats', verifyToken, requireSelfOrRole('agent', (req) => req.params.id, 'admin'), async (req, res) => {
     const agentId = req.params.id;
 
     try {
@@ -180,7 +187,7 @@ router.get('/:id/stats', async (req, res) => {
 });
 
 // Get Agent's Customers
-router.get('/:id/my-customers', async (req, res) => {
+router.get('/:id/my-customers', verifyToken, requireSelfOrRole('agent', (req) => req.params.id, 'admin'), async (req, res) => {
     const agentId = req.params.id;
 
     try {
@@ -193,7 +200,7 @@ router.get('/:id/my-customers', async (req, res) => {
             .select(`
                 customer_id,
                 visit_date,
-                customers (*)
+                customers (id, business_name, owner_name, email, phone, address, business_type, status, created_at, location_lat, location_lng, qr_code_url, image_url)
             `)
             .eq('agent_id', agentId)
             .order('visit_date', { ascending: false });
@@ -222,7 +229,7 @@ router.get('/:id/my-customers', async (req, res) => {
 });
 
 // UPDATE LOCATION
-router.post('/location', async (req, res) => {
+router.post('/location', verifyToken, requireSelfOrRole('agent', (req) => req.body?.id), async (req, res) => {
     const { id, lat, lng } = req.body;
     const now = new Date().toISOString();
 

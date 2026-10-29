@@ -6,6 +6,10 @@ const { requireRole } = require('../middleware/requireRole');
 const { recordInquiryEvent } = require('../services/inquiryEvents');
 const inquiryService = require('../services/inquiryService');
 const agentStatus = require('../services/agentStatus');
+const { TEAM_PERMISSION_CATALOG, sanitizePermissions } = require('../services/teamPermissions');
+const { rateLimit } = require('../middleware/rateLimit');
+const { transporter, logSmtpError, escapeHtml, frontendUrl, emailUser } = require('../services/mailer');
+const { INVITE_TTL_HOURS, EMAIL_RE, INVITATION_COLUMNS, newToken, hashToken, newExpiry, normalizeEmail, invitationStatus, withStatus } = require('../services/teamInvitations');
 
 // Every route in this file is admin-only.
 router.use(verifyToken, requireRole('admin'));
@@ -554,6 +558,320 @@ router.put('/inquiries/:id/assign-partner', async (req, res) => {
     } catch (err) {
         console.error('[admin] PUT inquiries/:id/assign-partner error:', err);
         res.status(500).json({ success: false, data: null, error: err.message || 'Failed to assign partner.' });
+    }
+});
+
+// ══════════════════════════════════════════════════════════
+// INTERNAL TEAM — access requests & page permissions
+// ══════════════════════════════════════════════════════════
+// Admin-only via this router's blanket gate. A team member's own token can never reach
+// these (verifyToken refuses internal_team tokens), so members can't approve themselves
+// or change their own permissions.
+
+// Everything except the password hash.
+const TEAM_ADMIN_COLUMNS = 'id, name, email, phone, department, request_note, designation, status, permissions, rejection_reason, reviewed_by, reviewed_at, last_login_at, created_at, updated_at';
+const TEAM_STATUSES = ['pending', 'approved', 'rejected', 'deactivated'];
+
+/** Security-relevant Admin changes go to the existing audit_logs table. Best-effort. */
+const auditTeamChange = (req, action, memberId, metadata) => {
+    supabase
+        .from('audit_logs')
+        .insert({
+            actor_user_id: req.user.id,
+            actor_role: 'admin',
+            action,
+            method: req.method,
+            path: req.originalUrl,
+            resource_id: String(memberId),
+            metadata,
+        })
+        .then(({ error }) => {
+            if (error) console.error('[audit_logs] team change insert failed:', error.message);
+        });
+};
+
+/** Validates Admin's designation + permissions input; returns { error } or { designation, permissions }. */
+const readTeamAccessInput = (body) => {
+    const designation = String(body?.designation || '').trim();
+    const permissions = sanitizePermissions(body?.permissions);
+    if (!designation) return { error: 'Designation is required.' };
+    if (Object.keys(permissions).length === 0) return { error: 'Grant access to at least one page.' };
+    return { designation, permissions };
+};
+
+/**
+ * Status-conditioned update so two Admins acting at once can't both win
+ * (e.g. one approves while another rejects). Sends 409 and returns null when the
+ * row has already moved on.
+ */
+const updateTeamMember = async (res, id, allowedFrom, fields) => {
+    const { data, error } = await supabase
+        .from('internal_team_members')
+        .update({ ...fields, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .in('status', allowedFrom)
+        .select(TEAM_ADMIN_COLUMNS)
+        .maybeSingle();
+    if (error && error.code !== '22P02') throw error;
+    if (!data) {
+        res.status(409).json({ success: false, data: null, error: 'This request was already handled or no longer exists. Reload and try again.' });
+        return null;
+    }
+    return { ...data, permissions: sanitizePermissions(data.permissions) };
+};
+
+// GET /api/admin/team-permissions — the modules/actions Admin can grant.
+router.get('/team-permissions', (req, res) => {
+    res.json({ success: true, data: TEAM_PERMISSION_CATALOG, error: null });
+});
+
+// GET /api/admin/team-members?status=pending
+router.get('/team-members', async (req, res) => {
+    const { status } = req.query;
+    if (status && !TEAM_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, data: null, error: `status must be one of: ${TEAM_STATUSES.join(', ')}.` });
+    }
+    try {
+        let query = supabase.from('internal_team_members').select(TEAM_ADMIN_COLUMNS);
+        if (status) query = query.eq('status', status);
+        const { data, error } = await query.order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json({ success: true, data: (data || []).map((m) => ({ ...m, permissions: sanitizePermissions(m.permissions) })), error: null });
+    } catch (err) {
+        console.error('[admin] GET team-members error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to load access requests.' });
+    }
+});
+
+// PUT /api/admin/team-members/:id/approve  { designation, permissions }
+router.put('/team-members/:id/approve', async (req, res) => {
+    const input = readTeamAccessInput(req.body);
+    if (input.error) return res.status(400).json({ success: false, data: null, error: input.error });
+    try {
+        const member = await updateTeamMember(res, req.params.id, ['pending', 'rejected'], {
+            status: 'approved',
+            designation: input.designation,
+            permissions: input.permissions,
+            rejection_reason: null,
+            reviewed_by: req.user.id,
+            reviewed_at: new Date().toISOString(),
+        });
+        if (!member) return;
+        auditTeamChange(req, 'team_member_approved', member.id, { designation: input.designation, permissions: input.permissions });
+        res.json({ success: true, data: member, error: null });
+    } catch (err) {
+        console.error('[admin] PUT team-members/:id/approve error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to approve request.' });
+    }
+});
+
+// PUT /api/admin/team-members/:id/reject  { reason? }
+router.put('/team-members/:id/reject', async (req, res) => {
+    const reason = String(req.body?.reason || '').trim() || null;
+    try {
+        const member = await updateTeamMember(res, req.params.id, ['pending'], {
+            status: 'rejected',
+            permissions: {},
+            rejection_reason: reason,
+            reviewed_by: req.user.id,
+            reviewed_at: new Date().toISOString(),
+        });
+        if (!member) return;
+        auditTeamChange(req, 'team_member_rejected', member.id, { reason });
+        res.json({ success: true, data: member, error: null });
+    } catch (err) {
+        console.error('[admin] PUT team-members/:id/reject error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to reject request.' });
+    }
+});
+
+// PUT /api/admin/team-members/:id/permissions  { designation, permissions }
+router.put('/team-members/:id/permissions', async (req, res) => {
+    const input = readTeamAccessInput(req.body);
+    if (input.error) return res.status(400).json({ success: false, data: null, error: input.error });
+    try {
+        const member = await updateTeamMember(res, req.params.id, ['approved', 'deactivated'], {
+            designation: input.designation,
+            permissions: input.permissions,
+        });
+        if (!member) return;
+        auditTeamChange(req, 'team_member_permissions_updated', member.id, { designation: input.designation, permissions: input.permissions });
+        res.json({ success: true, data: member, error: null });
+    } catch (err) {
+        console.error('[admin] PUT team-members/:id/permissions error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to update permissions.' });
+    }
+});
+
+// PATCH /api/admin/team-members/:id/status  { status: 'approved' | 'deactivated' }
+// Deactivating takes effect on the member's next request (loadTeamMember re-reads it).
+router.patch('/team-members/:id/status', async (req, res) => {
+    const status = String(req.body?.status || '').trim().toLowerCase();
+    if (status !== 'approved' && status !== 'deactivated') {
+        return res.status(400).json({ success: false, data: null, error: "status must be 'approved' or 'deactivated'." });
+    }
+    try {
+        const from = status === 'approved' ? ['deactivated'] : ['approved'];
+        const member = await updateTeamMember(res, req.params.id, from, { status });
+        if (!member) return;
+        auditTeamChange(req, status === 'approved' ? 'team_member_reactivated' : 'team_member_deactivated', member.id, {});
+        res.json({ success: true, data: member, error: null });
+    } catch (err) {
+        console.error('[admin] PATCH team-members/:id/status error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to update member status.' });
+    }
+});
+
+// ── Internal Team invitations ───────────────────────────────
+// Admin invites by email; the link lets that address register (POST
+// /api/auth/register/internal-team). An invitation grants nothing else: the member is
+// created 'pending' with no permissions and still goes through approve/permissions above.
+
+// Per-admin cap on sending mail (invite + resend share it).
+const inviteMailLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 30, keyFn: (req) => `admin:${req.user?.id}`, message: 'Too many invitations sent. Try again later.' });
+
+/** Throws if the mail server didn't accept the message. The link is never logged. */
+const sendTeamInvitationEmail = async (email, token) => {
+    const link = `${frontendUrl()}/register/internal_team?token=${encodeURIComponent(token)}`;
+    const info = await transporter.sendMail({
+        from: `"AIXOS Firefighter" <${emailUser}>`,
+        to: email,
+        subject: "You're invited to the AIXOS Internal Team",
+        html: `
+        <div style="font-family:sans-serif;max-width:520px;margin:auto;padding:24px">
+          <h2 style="color:#ef4444;margin-bottom:8px">You're invited to join the Internal Team</h2>
+          <p style="color:#475569;line-height:1.6">
+            An Admin of <strong>AIXOS Firefighter</strong> has invited <strong>${escapeHtml(email)}</strong>
+            to join the Internal Team. Use the button below to complete your profile and set your password.
+          </p>
+          <p style="margin:24px 0">
+            <a href="${link}" style="background:#ef4444;color:white;padding:12px 28px;border-radius:8px;text-decoration:none;display:inline-block;font-weight:bold">Complete Registration</a>
+          </p>
+          <p style="color:#475569;line-height:1.6">After you register, an Admin will review your account and assign the pages you can use.</p>
+          <p style="color:#666;font-size:13px">This link works once and expires in <strong>${INVITE_TTL_HOURS} hours</strong>. If you weren't expecting it, you can ignore this email.</p>
+        </div>`,
+    });
+    if (info.rejected && info.rejected.length > 0) throw new Error('Recipient rejected by mail server');
+};
+
+/** 409 message when this email already has a member row (a rejected one may be re-invited). */
+const existingMemberConflict = async (email) => {
+    const { data, error } = await supabase.from('internal_team_members').select('status').eq('email', email).maybeSingle();
+    if (error) throw error;
+    if (!data || data.status === 'rejected') return null;
+    return data.status === 'pending'
+        ? 'This person has already registered and is waiting for approval.'
+        : 'This email already has an Internal Team account.';
+};
+
+const auditInvitation = (req, action, invitation) => auditTeamChange(req, action, `invitation:${invitation.id}`, { email: invitation.email });
+
+// GET /api/admin/team-invitations
+router.get('/team-invitations', async (req, res) => {
+    try {
+        const { data, error } = await supabase.from('internal_team_invitations').select(INVITATION_COLUMNS)
+            .order('created_at', { ascending: false }).limit(500);
+        if (error) throw error;
+        res.json({ success: true, data: (data || []).map(withStatus), error: null });
+    } catch (err) {
+        console.error('[admin] GET team-invitations error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to load invitations.' });
+    }
+});
+
+// POST /api/admin/team-invitations { email }
+router.post('/team-invitations', inviteMailLimiter, async (req, res) => {
+    const email = normalizeEmail(req.body?.email);
+    if (!EMAIL_RE.test(email)) {
+        return res.status(400).json({ success: false, data: null, error: 'Enter a valid email address.' });
+    }
+    try {
+        const conflict = await existingMemberConflict(email);
+        if (conflict) return res.status(409).json({ success: false, data: null, error: conflict, code: 'ALREADY_MEMBER' });
+
+        const { data: open, error: openErr } = await supabase.from('internal_team_invitations').select('id')
+            .eq('email', email).is('used_at', null).is('revoked_at', null).maybeSingle();
+        if (openErr) throw openErr;
+        if (open) {
+            return res.status(409).json({ success: false, data: { id: open.id }, error: 'This email already has an open invitation. Use Resend or Revoke instead.', code: 'ALREADY_INVITED' });
+        }
+
+        const token = newToken();
+        const { data: invitation, error } = await supabase.from('internal_team_invitations')
+            .insert({ email, token_hash: hashToken(token), invited_by: req.user.id, expires_at: newExpiry() })
+            .select(INVITATION_COLUMNS).single();
+        if (error) {
+            if (error.code === '23505') return res.status(409).json({ success: false, data: null, error: 'This email already has an open invitation.', code: 'ALREADY_INVITED' });
+            throw error;
+        }
+
+        try {
+            await sendTeamInvitationEmail(email, token);
+        } catch (mailErr) {
+            logSmtpError('[team-invitations] send FAILED:', mailErr);
+            // Nothing was delivered, so don't leave an open invitation blocking a retry.
+            await supabase.from('internal_team_invitations').delete().eq('id', invitation.id);
+            return res.status(502).json({ success: false, data: null, error: 'Could not send the invitation email. Check the email settings and try again.' });
+        }
+
+        auditInvitation(req, 'team_invitation_sent', invitation);
+        res.status(201).json({ success: true, data: withStatus(invitation), error: null });
+    } catch (err) {
+        console.error('[admin] POST team-invitations error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to send invitation.' });
+    }
+});
+
+// POST /api/admin/team-invitations/:id/resend — new token + new expiry; the old link stops working.
+router.post('/team-invitations/:id/resend', inviteMailLimiter, async (req, res) => {
+    try {
+        const { data: current, error: curErr } = await supabase.from('internal_team_invitations').select(INVITATION_COLUMNS).eq('id', req.params.id).maybeSingle();
+        if (curErr && curErr.code !== '22P02') throw curErr;
+        if (!current) return res.status(404).json({ success: false, data: null, error: 'Invitation not found.' });
+        const status = invitationStatus(current);
+        if (status === 'used' || status === 'revoked') {
+            return res.status(409).json({ success: false, data: null, error: status === 'used' ? 'This invitation was already used.' : 'This invitation was revoked. Send a new invitation instead.' });
+        }
+        const conflict = await existingMemberConflict(current.email);
+        if (conflict) return res.status(409).json({ success: false, data: null, error: conflict, code: 'ALREADY_MEMBER' });
+
+        const token = newToken();
+        const { data: invitation, error } = await supabase.from('internal_team_invitations')
+            .update({ token_hash: hashToken(token), expires_at: newExpiry(), sent_at: new Date().toISOString(), send_count: (current.send_count || 1) + 1 })
+            .eq('id', current.id).is('used_at', null).is('revoked_at', null)
+            .select(INVITATION_COLUMNS).maybeSingle();
+        if (error) throw error;
+        if (!invitation) return res.status(409).json({ success: false, data: null, error: 'This invitation changed meanwhile. Reload and try again.' });
+
+        try {
+            await sendTeamInvitationEmail(invitation.email, token);
+        } catch (mailErr) {
+            logSmtpError('[team-invitations/resend] send FAILED:', mailErr);
+            return res.status(502).json({ success: false, data: null, error: 'Could not send the invitation email. The previous link no longer works — try Resend again.' });
+        }
+
+        auditInvitation(req, 'team_invitation_resent', invitation);
+        res.json({ success: true, data: withStatus(invitation), error: null });
+    } catch (err) {
+        console.error('[admin] POST team-invitations/:id/resend error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to resend invitation.' });
+    }
+});
+
+// POST /api/admin/team-invitations/:id/revoke
+router.post('/team-invitations/:id/revoke', async (req, res) => {
+    try {
+        const { data: invitation, error } = await supabase.from('internal_team_invitations')
+            .update({ revoked_at: new Date().toISOString(), revoked_by: req.user.id })
+            .eq('id', req.params.id).is('used_at', null).is('revoked_at', null)
+            .select(INVITATION_COLUMNS).maybeSingle();
+        if (error && error.code !== '22P02') throw error;
+        if (!invitation) return res.status(409).json({ success: false, data: null, error: 'This invitation was already used or revoked.' });
+        auditInvitation(req, 'team_invitation_revoked', invitation);
+        res.json({ success: true, data: withStatus(invitation), error: null });
+    } catch (err) {
+        console.error('[admin] POST team-invitations/:id/revoke error:', err);
+        res.status(500).json({ success: false, data: null, error: 'Failed to revoke invitation.' });
     }
 });
 

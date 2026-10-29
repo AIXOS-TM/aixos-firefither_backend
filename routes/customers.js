@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../supabase');
 const { verifyToken } = require('../middleware/auth');
-const { requireRole } = require('../middleware/requireRole');
+const { requireRole, requireSelfOrRole } = require('../middleware/requireRole');
 
 /**
  * Customers table uses location_lat / location_lng (not lat / lng).
@@ -105,7 +105,7 @@ router.get('/me/items', verifyToken, requireRole('customer'), async (req, res) =
 });
 
 // GET Customer Dashboard (Inventory + Pending Services)
-router.get('/:id/dashboard', async (req, res) => {
+router.get('/:id/dashboard', verifyToken, requireSelfOrRole('customer', (req) => req.params.id, 'agent', 'admin'), async (req, res) => {
     const customerId = req.params.id;
 
     try {
@@ -133,7 +133,7 @@ router.get('/:id/dashboard', async (req, res) => {
 });
 
 // GET Customer Inventory (Dedicated)
-router.get('/:id/inventory', async (req, res) => {
+router.get('/:id/inventory', verifyToken, requireSelfOrRole('customer', (req) => req.params.id, 'agent', 'admin'), async (req, res) => {
     const customerId = req.params.id;
     try {
         const { data, error } = await supabase
@@ -149,7 +149,7 @@ router.get('/:id/inventory', async (req, res) => {
 });
 
 // GET Customer History (Dedicated)
-router.get('/:id/history', async (req, res) => {
+router.get('/:id/history', verifyToken, requireSelfOrRole('customer', (req) => req.params.id, 'agent', 'admin'), async (req, res) => {
     const customerId = req.params.id;
     try {
         const { data, error } = await supabase
@@ -166,7 +166,7 @@ router.get('/:id/history', async (req, res) => {
 });
 
 // BOOK SERVICE
-router.post('/book', async (req, res) => {
+router.post('/book', verifyToken, requireSelfOrRole('customer', (req) => req.body?.customerId, 'agent', 'admin'), async (req, res) => {
     const { customerId, serviceType, date, notes, assetIds } = req.body;
 
     try {
@@ -192,7 +192,7 @@ router.post('/book', async (req, res) => {
 });
 
 // ADD EXTINGUISHER
-router.post('/inventory', async (req, res) => {
+router.post('/inventory', verifyToken, requireSelfOrRole('customer', (req) => req.body?.customerId, 'agent', 'admin'), async (req, res) => {
     const { customerId, type, capacity, quantity, installDate, expiryDate } = req.body;
     try {
         const { data, error } = await supabase
@@ -211,7 +211,7 @@ router.post('/inventory', async (req, res) => {
 });
 
 // UPDATE LOCATION (legacy POST — same column mapping as PATCH)
-router.post('/location', async (req, res) => {
+router.post('/location', verifyToken, requireSelfOrRole('customer', (req) => req.body?.id, 'admin'), async (req, res) => {
     const { id } = req.body;
     if (!id) {
         return res.status(400).json({

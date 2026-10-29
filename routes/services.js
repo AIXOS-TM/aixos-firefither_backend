@@ -1,6 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../supabase');
+const { verifyToken } = require('../middleware/auth');
+const { requireRole } = require('../middleware/requireRole');
+
+// Admin-only: lists every customer's bookings and reassigns agents.
+router.use(verifyToken, requireRole('admin'));
 
 // GET All Services (Admin) or filtered
 router.get('/', async (req, res) => {

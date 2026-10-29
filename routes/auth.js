@@ -9,85 +9,30 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 const { verifyToken } = require('../middleware/auth');
 const { requireRole } = require('../middleware/requireRole');
+const { adminRecipientIds } = require('../services/agentStatus');
+const { sanitizePermissions } = require('../services/teamPermissions');
+const { rateLimit } = require('../middleware/rateLimit');
+const {
+  INVITE_ERRORS, invitationStatus, normalizeEmail: normalizeInviteEmail,
+  findByToken: findTeamInvitation, claim: claimTeamInvitation, releaseClaim: releaseTeamInvitation,
+} = require('../services/teamInvitations');
 
 const ROLE_TABLES = { agent: 'agents', customer: 'customers', admin: 'admins', partner: 'partners' };
+
+// Admin rows created before passwords were hashed still hold plain text. Login accepts
+// those once (constant-time compare) and immediately replaces them with a bcrypt hash.
+const BCRYPT_HASH = /^\$2[aby]\$\d{2}\$/;
+const plainTextEquals = (a, b) => {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
 
 const SECRET_KEY = process.env.JWT_SECRET || 'super_secret_key_fire_marketplace';
 const IMPERSONATION_TTL_SECONDS = 45 * 60; // 45 minutes — short-lived by design
 
-// ── SMTP transporter (created once at startup) ──────────────────────────────
-
-// Sanitize env vars before use:
-//  - trim() removes leading/trailing whitespace
-//  - replace(\r) removes Windows CRLF that dotenv sometimes leaves on the value
-//  - replace outer double-quotes in case dotenv didn't strip them (e.g. `"#pass"` → `#pass`)
-const smtpHost = (process.env.EMAIL_HOST || 'smtp.hostinger.com').trim().replace(/\r/g, '');
-const emailPort = parseInt((process.env.EMAIL_PORT || '465').trim(), 10);
-const emailUser = (process.env.EMAIL_USER || '').trim().replace(/\r/g, '');
-const emailPass = (process.env.EMAIL_PASS || '')
-  .replace(/\r/g, '')           // strip Windows CR
-  .replace(/^["']|["']$/g, ''); // strip surrounding quotes dotenv may have left
-
-console.log('[SMTP] Loaded config:', {
-  host: smtpHost || '(missing)',
-  port: emailPort,
-  secure: emailPort === 465,
-  user: emailUser || '(missing)',
-  passLength: emailPass.length,
-  passFirstChar: emailPass.charAt(0) || '(empty)',
-  passHasQuotes: /^["']|["']$/.test(process.env.EMAIL_PASS || ''),
-  passHasCR: (process.env.EMAIL_PASS || '').includes('\r'),
-});
-
-const transporter = nodemailer.createTransport({
-  host: smtpHost,
-  port: emailPort,
-  secure: emailPort === 465,  // true = implicit SSL (465); false = STARTTLS (587)
-  auth: {
-    type: 'login',            // Hostinger rejects AUTH PLAIN; force AUTH LOGIN
-    user: emailUser,
-    pass: emailPass,
-  },
-  tls: {
-    rejectUnauthorized: false,
-  },
-  connectionTimeout: 10000,
-  greetingTimeout: 5000,
-  socketTimeout: 15000,
-});
-
-// Full SMTP error dump — Nodemailer/SMTPConnection errors carry most of the
-// useful diagnostic info on non-enumerable/plain properties that
-// console.error(err) or JSON.stringify(err) silently drop (errno, syscall,
-// address, port, command, stack). Log every field explicitly so production
-// logs actually show why a send failed instead of just "[FAILED]".
-function logSmtpError(label, err) {
-  console.error(`${label}`, {
-    message: err.message,
-    code: err.code,             // e.g. ETIMEDOUT, ECONNREFUSED, EAUTH, ESOCKET
-    errno: err.errno,
-    syscall: err.syscall,       // e.g. 'connect'
-    address: err.address,       // IP actually dialed (after DNS resolution)
-    port: err.port,
-    command: err.command,       // last SMTP command sent (e.g. 'CONN', 'AUTH LOGIN')
-    response: err.response,     // raw SMTP server response, if any was received
-    responseCode: err.responseCode,
-    stack: err.stack,
-  });
-}
-
-// Startup SMTP health check — runs once when this module loads (i.e. on
-// server boot), so a broken/blocked SMTP path shows up in the deploy logs
-// immediately instead of surfacing later as a user-facing "Failed to send" error.
-console.log('[SMTP] Running startup health check against', smtpHost + ':' + emailPort, '...');
-transporter.verify((err) => {
-  if (err) {
-    logSmtpError('[SMTP] Startup verify FAILED — outbound SMTP is not reachable/authenticating:', err);
-  } else {
-    console.log('[SMTP] Startup verify OK — Ready and authenticated as', emailUser);
-  }
-});
-// ────────────────────────────────────────────────────────────────────────────
+// SMTP transporter + config live in services/mailer.js (shared with other routes).
+const { transporter, logSmtpError, smtpHost, emailPort, emailUser, emailPass } = require('../services/mailer');
 
 // Configure Multer Storage
 const storage = multer.diskStorage({
@@ -138,7 +83,6 @@ router.post(
   ]),
   async (req, res) => {
     console.log("REQ FILES:", req.files); // <- debug
-    console.log("REQ BODY:", req.body);
 
     const { name, email, password, phone, territory, terms_accepted } = req.body;
     const emailLower = email.trim().toLowerCase();
@@ -329,11 +273,139 @@ router.post('/register/partner', async (req, res) => {
   }
 });
 
+// ── INTERNAL TEAM — invitation-only registration ─────────────────────────
+// There is no self-service sign-up: an Admin invites an email (POST
+// /api/admin/team-invitations) and only that link can register. Registering creates the
+// existing access-request row as 'pending' with no permissions — login is still refused
+// until an Admin approves it and assigns pages on Access Requests.
+const teamInviteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message: 'Too many attempts. Please wait a few minutes and try again.' });
+
+const sendInviteError = (res, reason) => {
+  const e = INVITE_ERRORS[reason] || INVITE_ERRORS.invalid;
+  return res.status(e.status).json({ error: e.error, code: e.code });
+};
+
+// POST /api/auth/team-invitations/verify { token } — lets the registration page show the
+// invited email (read-only) or a clear invalid/expired/used/revoked state.
+router.post('/team-invitations/verify', teamInviteLimiter, async (req, res) => {
+  try {
+    const invitation = await findTeamInvitation(req.body?.token);
+    if (!invitation) return sendInviteError(res, 'invalid');
+    const status = invitationStatus(invitation);
+    if (status !== 'pending') return sendInviteError(res, status);
+    res.json({ email: invitation.email, expires_at: invitation.expires_at });
+  } catch (err) {
+    console.error('[team-invitations/verify] Error:', err?.message || err);
+    res.status(500).json({ error: 'Could not check the invitation.' });
+  }
+});
+
+// POST /api/auth/register/internal-team { token, name, password, phone?, department?, request_note? }
+// The email always comes from the invitation; a different email in the body is refused.
+router.post('/register/internal-team', teamInviteLimiter, async (req, res) => {
+  const token = req.body?.token;
+  const name = String(req.body?.name || '').trim();
+  const password = String(req.body?.password || '');
+  const phone = String(req.body?.phone || '').trim() || null;
+  const department = String(req.body?.department || '').trim() || null;
+  const requestNote = String(req.body?.request_note || '').trim() || null;
+
+  if (!token) return sendInviteError(res, 'invalid');
+
+  let claimed = null;
+  try {
+    const invitation = await findTeamInvitation(token);
+    if (!invitation) return sendInviteError(res, 'invalid');
+    const status = invitationStatus(invitation);
+    if (status !== 'pending') return sendInviteError(res, status);
+
+    const email = invitation.email;
+    if (req.body?.email != null && String(req.body.email).trim() !== '' && normalizeInviteEmail(req.body.email) !== email) {
+      return res.status(400).json({ error: 'This invitation is for a different email address.', code: 'INVITE_EMAIL_MISMATCH' });
+    }
+    if (!name || !password) {
+      return res.status(400).json({ error: 'Name and password are required' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const { data: existing, error: existingErr } = await supabase
+      .from('internal_team_members')
+      .select('id, status')
+      .eq('email', email)
+      .maybeSingle();
+    if (existingErr) throw existingErr;
+    if (existing && existing.status === 'pending') {
+      return res.status(409).json({ error: 'An access request for this email is already pending review' });
+    }
+    if (existing && existing.status !== 'rejected') {
+      return res.status(409).json({ error: 'An internal team account already exists for this email' });
+    }
+
+    // Claim the invitation first so the same link can't register twice concurrently.
+    const result = await claimTeamInvitation(token);
+    if (!result.invitation) return sendInviteError(res, result.reason);
+    claimed = result.invitation;
+
+    // Fixed values, never from the client: pending, no permissions, no designation.
+    const fields = {
+      name, email, phone, department,
+      request_note: requestNote,
+      password: bcrypt.hashSync(password, 8),
+      status: 'pending',
+      permissions: {},
+      designation: null,
+      rejection_reason: null,
+      reviewed_by: null,
+      reviewed_at: null,
+      updated_at: new Date().toISOString(),
+    };
+
+    // A previously rejected person who was re-invited reuses their row (unique email).
+    const { data: saved, error: saveErr } = existing
+      ? await supabase.from('internal_team_members').update(fields).eq('id', existing.id).eq('status', 'rejected').select('id').maybeSingle()
+      : await supabase.from('internal_team_members').insert(fields).select('id').single();
+    if (saveErr || !saved) {
+      await releaseTeamInvitation(claimed.id);
+      if (!saveErr || saveErr.code === '23505') {
+        return res.status(409).json({ error: 'An access request for this email already exists' });
+      }
+      throw saveErr;
+    }
+
+    await supabase.from('internal_team_invitations').update({ member_id: saved.id }).eq('id', claimed.id);
+
+    try {
+      const rows = (await adminRecipientIds()).map((id) => ({
+        sender_role: 'Internal Team',
+        recipient_id: id,
+        recipient_role: 'Admin',
+        message: `${name} (${email}) completed their Internal Team invitation and is waiting for approval${department ? ` — ${department}` : ''}.`,
+        inquiry_id: null,
+        type: 'team_access_request',
+        title: 'New Access Request',
+      }));
+      if (rows.length > 0) {
+        const { error } = await supabase.from('notifications').insert(rows);
+        if (error) console.error('[register/internal-team] admin notification error:', error.message);
+      }
+    } catch (err) {
+      console.error('[register/internal-team] admin notification failed:', err?.message || err);
+    }
+
+    res.status(201).json({ message: 'Registration complete. An Admin will review your account.', id: saved.id });
+  } catch (err) {
+    if (claimed) await releaseTeamInvitation(claimed.id).catch(() => {});
+    console.error('Register Internal Team Error:', err?.message || err);
+    res.status(500).json({ error: 'Error completing registration' });
+  }
+});
+
 // LOGIN (Generic)
 router.post('/login', async (req, res) => {
   const { email, password, role } = req.body;
 
-  console.log('Backend req.body:', req.body);
 
   if (!email || !password || !role) {
     return res.status(400).json({ error: 'Email, password and role are required' });
@@ -346,6 +418,7 @@ router.post('/login', async (req, res) => {
   else if (role === 'customer') table = 'customers';
   else if (role === 'admin') table = 'admins';
   else if (role === 'partner') table = 'partners';
+  else if (role === 'internal_team') table = 'internal_team_members';
   else return res.status(400).json({ error: 'Invalid role' });
 
   try {
@@ -359,14 +432,26 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const passwordIsValid =
-      role === 'admin'
-        ? password === user.password // plain text compare
-        : bcrypt.compareSync(password, user.password);
+    const isLegacyPlainText = role === 'admin' && !BCRYPT_HASH.test(String(user.password || ''));
+    const passwordIsValid = isLegacyPlainText
+      ? plainTextEquals(password, user.password)
+      : bcrypt.compareSync(password, user.password);
 
     if (!passwordIsValid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
+
+    if (isLegacyPlainText) {
+      // Conditioned on the old value so a concurrent password change isn't overwritten.
+      const { error: upgradeErr } = await supabase
+        .from('admins')
+        .update({ password: bcrypt.hashSync(password, 10) })
+        .eq('id', user.id)
+        .eq('password', user.password);
+      if (upgradeErr) console.error('[login] admin password hash upgrade failed:', upgradeErr.message);
+    }
+    // Never send a stored password (hash or legacy plain text) back to the browser.
+    delete user.password;
 
 
     if (role === 'agent') {
@@ -374,6 +459,27 @@ router.post('/login', async (req, res) => {
       if (s !== 'accepted' && s !== 'active') {
         return res.status(403).json({ error: 'Account pending approval' });
       }
+    }
+
+    if (role === 'internal_team') {
+      // Checked only after the password, so the response can't be used to probe
+      // which emails have requests.
+      if (user.status === 'pending') {
+        return res.status(403).json({ error: 'Your access request is pending Admin approval' });
+      }
+      if (user.status === 'rejected') {
+        return res.status(403).json({ error: 'Your access request was not approved' });
+      }
+      if (user.status !== 'approved') {
+        return res.status(403).json({ error: 'Your access has been deactivated. Contact an Admin.' });
+      }
+      await supabase
+        .from('internal_team_members')
+        .update({ last_login_at: new Date().toISOString() })
+        .eq('id', user.id);
+      const { password: _password, ...member } = user;
+      const token = jwt.sign({ id: user.id, role }, SECRET_KEY, { expiresIn: '24h' });
+      return res.status(200).json({ auth: true, token, user: { ...member, permissions: sanitizePermissions(member.permissions) } });
     }
 
     const token = jwt.sign({ id: user.id, role }, SECRET_KEY, { expiresIn: '24h' });
@@ -545,15 +651,30 @@ router.post('/forgot-password', async (req, res) => {
 });
 
 // SEND CUSTOMER SETUP EMAIL — token is a signed JWT (no extra DB columns needed)
-router.post('/send-setup-email', async (req, res) => {
-  const { customerId, email, businessName } = req.body;
+// Agents/Admins only. The link lets whoever receives it set the customer's password, so it
+// is sent ONLY to the email already stored on that customer — never to an address from the
+// request body (which would let anyone take over any customer account).
+router.post('/send-setup-email', verifyToken, requireRole('agent', 'admin'), async (req, res) => {
+  const { customerId } = req.body;
 
-  console.log('[send-setup-email] Request received:', { customerId, email, businessName });
-
-  if (!customerId || !email) {
-    console.warn('[send-setup-email] Missing fields:', { customerId, email });
-    return res.status(400).json({ error: 'customerId and email are required' });
+  if (!customerId) {
+    return res.status(400).json({ error: 'customerId is required' });
   }
+
+  const { data: customer, error: customerErr } = await supabase
+    .from('customers')
+    .select('id, email, business_name')
+    .eq('id', customerId)
+    .maybeSingle();
+  if (customerErr && customerErr.code !== '22P02') {
+    console.error('[send-setup-email] customer lookup failed:', customerErr.message);
+    return res.status(500).json({ error: 'Failed to send setup email' });
+  }
+  if (!customer || !customer.email) {
+    return res.status(404).json({ error: 'Customer not found or has no email' });
+  }
+  const email = customer.email;
+  const businessName = customer.business_name;
 
   // Skip auto-generated placeholder emails
   if (email.includes('@aixos-placeholder.com') || email.includes('@temp.com')) {
@@ -572,7 +693,6 @@ router.post('/send-setup-email', async (req, res) => {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     const setupLink = `${frontendUrl}/set-password?token=${setupToken}`;
 
-    console.log('[send-setup-email] Setup link generated:', setupLink);
     console.log('[send-setup-email] Sending via SMTP:', {
       from: emailUser,
       to: email,
@@ -695,9 +815,7 @@ router.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Invalid or expired OTP' });
     }
 
-    // Admins are still compared as plain text at login (see /login above) — match
-    // that existing behavior here rather than silently locking admins out.
-    const newStoredPassword = role === 'admin' ? newPassword : bcrypt.hashSync(newPassword, 8);
+    const newStoredPassword = bcrypt.hashSync(newPassword, role === 'admin' ? 10 : 8);
 
     const { error: updateError } = await supabase
       .from(table)
@@ -718,7 +836,7 @@ router.post('/reset-password', async (req, res) => {
 // SMTP PROBE — GET /api/auth/test-smtp
 // Tests every valid Hostinger/webmail SMTP config in parallel and reports
 // which one (if any) authenticates successfully with the current credentials.
-router.get('/test-smtp', async (req, res) => {
+router.get('/test-smtp', verifyToken, requireRole('admin'), async (req, res) => {
   const domain = emailUser.split('@')[1] || '';
 
   // Every configuration Hostinger / cPanel webmail can possibly use

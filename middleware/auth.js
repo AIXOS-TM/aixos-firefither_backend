@@ -4,7 +4,13 @@ const SECRET_KEY = process.env.JWT_SECRET || 'super_secret_key_fire_marketplace'
 
 const AUDITED_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
 
-const verifyToken = (req, res, next) => {
+// Internal team tokens are only valid on routes that opt in (routes/team.js uses
+// verifyTeamToken). Every other route in the app uses verifyToken, and many of those
+// only check "is logged in" rather than a specific role — so a team member's token
+// must be refused there, or it could reach Admin/Agent/Partner/Customer workflows.
+const INTERNAL_TEAM_ROLE = 'internal_team';
+
+const buildVerifyToken = ({ allowInternalTeam }) => (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
@@ -27,6 +33,10 @@ const verifyToken = (req, res, next) => {
             }
         }
         return res.status(403).json({ error: 'Invalid or expired token.' });
+    }
+
+    if ((decoded.role === INTERNAL_TEAM_ROLE) !== Boolean(allowInternalTeam)) {
+        return res.status(403).json({ error: 'Forbidden: this account cannot access this resource.' });
     }
 
     req.user = { id: decoded.id, role: decoded.role }; // preserved shape used across the app
@@ -65,4 +75,7 @@ const verifyToken = (req, res, next) => {
     next();
 };
 
-module.exports = { verifyToken };
+const verifyToken = buildVerifyToken({ allowInternalTeam: false });
+const verifyTeamToken = buildVerifyToken({ allowInternalTeam: true });
+
+module.exports = { verifyToken, verifyTeamToken, INTERNAL_TEAM_ROLE };

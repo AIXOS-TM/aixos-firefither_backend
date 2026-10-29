@@ -6,7 +6,7 @@ const { requireRole } = require('../middleware/requireRole');
 
 // GET /api/senior-agents
 // Admin: list all senior agents with their team member count.
-router.get('/', async (req, res) => {
+router.get('/', verifyToken, requireRole('admin'), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('senior_agents')
@@ -43,9 +43,15 @@ router.get('/', async (req, res) => {
 
 // GET /api/senior-agents/:id/team
 // Returns team members for a given senior_agent record id.
-router.get('/:id/team', async (req, res) => {
+router.get('/:id/team', verifyToken, requireRole('admin', 'agent'), async (req, res) => {
   const { id } = req.params;
   try {
+    // An agent may only read the team they lead.
+    if (req.user.role === 'agent') {
+      const { data: own } = await supabase
+        .from('senior_agents').select('id').eq('id', id).eq('agent_id', req.user.id).maybeSingle();
+      if (!own) return res.status(403).json({ error: 'Forbidden: not your team' });
+    }
     const { data, error } = await supabase
       .from('senior_agent_teams')
       .select('id, assigned_at, agent_id, agents(id, name, email, status, profile_photo, territory)')

@@ -26,6 +26,7 @@ const partnersRoutes = require('./routes/partners');
 const inquiryRoutes = require('./routes/inquiryRoutes');
 const maintenanceRoutes = require('./routes/maintenanceRoutes');
 const seniorAgentsRoutes = require('./routes/seniorAgents');
+const teamRoutes = require('./routes/team');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/agents', agentsRoutes);
@@ -38,6 +39,7 @@ app.use('/api', maintenanceRoutes); // PATCH /inquiries/:id/accept, site-assessm
 app.use('/api', inquiryRoutes); // Mounts /api/inquiries, /api/inquiry-items, etc.
 app.use('/api', chatRoutes); // Mounts /api/queries and /api/customers/:id/header
 app.use('/api/senior-agents', seniorAgentsRoutes);
+app.use('/api/team', teamRoutes); // Internal Team — permission-gated, see routes/team.js
 
 
 app.listen(PORT, () => {

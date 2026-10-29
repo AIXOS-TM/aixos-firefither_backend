@@ -64,7 +64,7 @@ async function setAgentStatus(agentId, nextStatus, actingAdmin) {
             await recordInquiryEvent({
                 inquiryId: inq.id,
                 eventType: 'routed_to_admin',
-                actor: { id: actingAdmin?.id, role: 'admin' },
+                actor: { id: actingAdmin?.id, role: actingAdmin?.role || 'admin' },
                 metadata: { reason: 'agent_inactive', agent_id: agent.id, agent_status: status },
             });
         }

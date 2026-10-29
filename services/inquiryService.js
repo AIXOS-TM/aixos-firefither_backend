@@ -1027,7 +1027,7 @@ class InquiryService {
         await recordInquiryEvent({
             inquiryId,
             eventType: 'agent_assigned',
-            actor: { id: actingAdmin?.id, role: 'admin' },
+            actor: { id: actingAdmin?.id, role: actingAdmin?.role || 'admin' },
             metadata: previousAgentId == null
                 ? { source: 'admin_assign', agent_id: agent.id }
                 : { source: 'admin_reassign_inactive', agent_id: agent.id, previous_agent_id: previousAgentId, previous_agent_status: previousAgentStatus },
